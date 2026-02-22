@@ -1,5 +1,5 @@
 {
-  "name": "binsr-webhook",
+  "name": "estimate-webhook",
   "private": true,
   "scripts": {
     "dev": "next dev",
