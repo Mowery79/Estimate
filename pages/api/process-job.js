@@ -7,6 +7,7 @@ import xlsx from "xlsx";
 import sgMail from "@sendgrid/mail";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
+console.log("SUPABASE_URL", process.env.SUPABASE_URL);
 
 /**
  * ================
