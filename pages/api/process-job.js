@@ -6,6 +6,7 @@ import sgMail from "@sendgrid/mail";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
+/** Download a URL (Tally private URL with token) to /tmp */
 async function downloadToTmp(fileUrl, filename) {
   const resp = await fetch(fileUrl);
   if (!resp.ok) throw new Error(`Download failed ${resp.status}: ${resp.statusText}`);
@@ -15,6 +16,7 @@ async function downloadToTmp(fileUrl, filename) {
   return filePath;
 }
 
+/** Download Supabase Storage file to /tmp */
 async function downloadPricebookToTmp(supabase) {
   const { data, error } = await supabase.storage.from("pricebooks").download("active.xlsx");
   if (error) throw error;
@@ -26,43 +28,56 @@ async function downloadPricebookToTmp(supabase) {
   return tmpPath;
 }
 
+/** Load PRICEBOOK + ALIASES TABLE into lookup maps */
 function loadPricebookAndAliases(pricebookPath) {
   const wb = xlsx.readFile(pricebookPath);
 
   const pbSheet = wb.Sheets["PRICEBOOK"];
   const aliasSheet = wb.Sheets["ALIASES TABLE"];
+  if (!pbSheet) throw new Error("PRICEBOOK sheet not found in active.xlsx");
+  if (!aliasSheet) throw new Error("ALIASES TABLE sheet not found in active.xlsx");
 
-  if (!pbSheet) throw new Error("PRICEBOOK sheet not found in pricebook");
-  if (!aliasSheet) throw new Error("ALIASES TABLE sheet not found in pricebook");
-
-  const pricebook = xlsx.utils.sheet_to_json(pbSheet, { defval: "" });
-  const aliases = xlsx.utils.sheet_to_json(aliasSheet, { defval: "" });
+  const pricebookRows = xlsx.utils.sheet_to_json(pbSheet, { defval: "" });
+  const aliasRows = xlsx.utils.sheet_to_json(aliasSheet, { defval: "" });
 
   const pbById = new Map();
-  for (const row of pricebook) {
+  for (const row of pricebookRows) {
     const id = String(row["ITEM ID"] || row["ITEMID"] || "").trim();
-    if (id) pbById.set(id, row);
+    if (!id) continue;
+    pbById.set(id, row);
   }
 
   const aliasMap = [];
-  for (const a of aliases) {
-    const aliasText = String(a["ALIAS"] || a["Alias"] || a["ALIAS TEXT"] || a["AliasText"] || "")
+  for (const a of aliasRows) {
+    // Adjust these keys if your alias sheet uses different column names
+    const aliasText = String(
+      a["ALIAS"] || a["Alias"] || a["ALIAS TEXT"] || a["AliasText"] || ""
+    )
       .trim()
       .toLowerCase();
-    const itemId = String(a["ITEM ID"] || a["ItemID"] || a["ITEMID"] || "").trim();
-    if (aliasText && itemId) aliasMap.push({ aliasText, itemId });
+
+    const itemId = String(a["ITEM ID"] || a["ITEMID"] || a["ItemID"] || "").trim();
+
+    if (!aliasText || !itemId) continue;
+    aliasMap.push({ aliasText, itemId });
   }
 
+  // Match longer aliases first
   aliasMap.sort((x, y) => y.aliasText.length - x.aliasText.length);
+
   return { pbById, aliasMap };
 }
 
+/** Simple substring alias matching */
 function matchItemIdByAlias(aliasMap, text) {
   const t = (text || "").toLowerCase();
-  for (const a of aliasMap) if (t.includes(a.aliasText)) return a.itemId;
+  for (const a of aliasMap) {
+    if (t.includes(a.aliasText)) return a.itemId;
+  }
   return null;
 }
 
+/** OpenAI: extract repair items as strict JSON {items:[{text,qty}]} */
 async function extractRepairsWithOpenAI(pdfPath) {
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
@@ -76,10 +91,21 @@ async function extractRepairsWithOpenAI(pdfPath) {
       {
         role: "user",
         content: [
-          { type: "input_text", text: "Extract repair items only. Return each as {text, qty}. If qty unclear, qty=1." },
-          { type: "input_file", filename: path.basename(pdfPath), file_data: base64 }
-        ]
-      }
+          {
+            type: "input_text",
+            text:
+              "You are extracting repair/defect items from a BINSR or home inspection report. " +
+              "Return only items that require repair/correction. " +
+              "Keep each item concise. If quantity is unclear, set qty=1. " +
+              "Do not include general disclaimers, maintenance tips, or purely informational notes.",
+          },
+          {
+            type: "input_file",
+            filename: path.basename(pdfPath),
+            file_data: base64,
+          },
+        ],
+      },
     ],
     text: {
       format: {
@@ -93,23 +119,27 @@ async function extractRepairsWithOpenAI(pdfPath) {
               type: "array",
               items: {
                 type: "object",
-                properties: { text: { type: "string" }, qty: { type: "number" } },
+                properties: {
+                  text: { type: "string" },
+                  qty: { type: "number" },
+                },
                 required: ["text", "qty"],
-                additionalProperties: false
-              }
-            }
+                additionalProperties: false,
+              },
+            },
           },
           required: ["items"],
-          additionalProperties: false
-        }
-      }
-    }
+          additionalProperties: false,
+        },
+      },
+    },
   });
 
   const parsed = JSON.parse(response.output_text || "{}");
   return parsed.items || [];
 }
 
+/** Build a simple PDF estimate buffer */
 function buildEstimatePdf({ job, lines, totals }) {
   return new Promise((resolve) => {
     const doc = new PDFDocument({ margin: 40 });
@@ -119,52 +149,68 @@ function buildEstimatePdf({ job, lines, totals }) {
 
     doc.fontSize(16).text("BINSR PROS — Repair Estimate");
     doc.moveDown(0.5);
-    doc.fontSize(10).text(`Generated: ${new Date().toLocaleString()}`);
-    doc.text(`Agent: ${job.name || ""} | ${job.email || ""}`);
+
+    doc.fontSize(10).text(`Estimate ID: ${job.id}`);
+    doc.text(`Generated: ${new Date().toLocaleString()}`);
+    doc.text(`Agent: ${job.name || ""}  |  ${job.email || ""}`);
+    if (job.phone) doc.text(`Phone: ${job.phone}`);
+    if (job.notes) doc.text(`Notes: ${job.notes}`);
     doc.moveDown();
 
     doc.fontSize(12).text("Scope & Pricing");
     doc.moveDown(0.5);
 
     doc.fontSize(10);
-    for (const ln of lines) {
-      doc.text(`${ln.itemId} — ${ln.itemName}`);
-      doc.text(`Qty: ${ln.qty}  Unit Price: $${ln.unitPrice.toFixed(2)}  Line: $${ln.lineTotal.toFixed(2)}`);
-      if (ln.description) doc.text(`Scope: ${ln.description}`);
-      doc.moveDown(0.6);
+    if (!lines.length) {
+      doc.text("No line items could be auto-matched from the uploaded report.");
+      doc.text("We will review the report and follow up with an updated estimate within 24 hours.");
+      doc.moveDown();
+    } else {
+      for (const ln of lines) {
+        doc.text(`${ln.itemId} — ${ln.itemName}`);
+        doc.text(
+          `Qty: ${ln.qty}  Unit: ${ln.unit}  Unit Price: $${ln.unitPrice.toFixed(2)}  Line: $${ln.lineTotal.toFixed(
+            2
+          )}`
+        );
+        if (ln.description) doc.text(`Scope: ${ln.description}`);
+        doc.moveDown(0.6);
+      }
     }
 
     doc.moveDown(0.5);
     doc.fontSize(12).text("Totals");
     doc.fontSize(10);
-    doc.text(`Subtotal: $${totals.subtotal.toFixed(2)}`);
+    doc.text(`Repairs Subtotal: $${totals.subtotal.toFixed(2)}`);
     doc.text(`Tax: $${totals.tax.toFixed(2)}`);
     doc.text(`Trip Fee: $${totals.tripFee.toFixed(2)}`);
     doc.fontSize(12).text(`Total: $${totals.total.toFixed(2)}`);
+
     doc.end();
   });
 }
 
 export default async function handler(req, res) {
   try {
-    // Required env vars
-    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ ok: false, error: "Missing OPENAI_API_KEY" });
-    if (!process.env.SENDGRID_API_KEY) return res.status(500).json({ ok: false, error: "Missing SENDGRID_API_KEY" });
-    if (!process.env.FROM_EMAIL) return res.status(500).json({ ok: false, error: "Missing FROM_EMAIL" });
+    // Validate required env vars
+    const required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "OPENAI_API_KEY", "SENDGRID_API_KEY", "FROM_EMAIL"];
+    for (const k of required) {
+      if (!process.env[k]) return res.status(500).json({ ok: false, error: `Missing env var ${k}` });
+    }
 
     sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
     const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
     // 1) Get oldest queued job
-    const { data: jobs, error } = await supabase
+    const { data: jobs, error: qErr } = await supabase
       .from("estimate_jobs")
       .select("*")
       .eq("status", "queued")
       .order("created_at", { ascending: true })
       .limit(1);
 
-    if (error) throw error;
+    if (qErr) throw qErr;
     if (!jobs?.length) return res.status(200).json({ ok: true, message: "No queued jobs" });
 
     const job = jobs[0];
@@ -172,7 +218,7 @@ export default async function handler(req, res) {
     // 2) Mark processing
     await supabase.from("estimate_jobs").update({ status: "processing", error: null }).eq("id", job.id);
 
-    // 3) Choose BINSR if present, else Inspection
+    // 3) Choose BINSR if present else Inspection
     const sourceUrl = job.binsr_url || job.inspection_url;
     if (!sourceUrl) throw new Error("Job has no binsr_url or inspection_url");
 
@@ -184,7 +230,7 @@ export default async function handler(req, res) {
     // 5) Load pricebook + aliases
     const { pbById, aliasMap } = loadPricebookAndAliases(pricebookPath);
 
-    // 6) Extract repair items (OpenAI)
+    // 6) Extract repair items with OpenAI
     const extracted = await extractRepairsWithOpenAI(reportPath);
 
     // 7) Match + price
@@ -194,32 +240,40 @@ export default async function handler(req, res) {
       const qty = Number(it.qty || 1) || 1;
 
       const itemId = matchItemIdByAlias(aliasMap, rawText);
-      if (!itemId) continue;
+      if (!itemId) continue; // MVP: skip unmatched (later: mark REVIEW)
 
       const pb = pbById.get(itemId);
       if (!pb) continue;
 
       const unitPrice = Number(pb["PRICE"] || pb["UNIT PRICE"] || pb["Unit Price"] || 0) || 0;
-      const itemName = String(pb["ITEM NAME"] || "");
-      const description = String(pb["ESTIMATE DESCRIPTION"] || "");
+      const itemName = String(pb["ITEM NAME"] || pb["Item Name"] || "");
+      const unit = String(pb["UNIT"] || "ea");
+      const description = String(pb["ESTIMATE DESCRIPTION"] || pb["Estimate Description"] || "");
+
       lines.push({
         itemId,
         itemName,
+        unit,
         qty,
         unitPrice,
         lineTotal: unitPrice * qty,
-        description
+        description,
       });
     }
 
+    // Totals (replace with tblSettings/tblTripFees later)
     const subtotal = lines.reduce((s, l) => s + l.lineTotal, 0);
-    const taxRate = 0.112;   // update later from tblSettings
+    const taxRate = 0.112;
     const tax = subtotal * taxRate;
-    const tripFee = 0;       // update later from tblTripFees
+    const tripFee = 0;
     const total = subtotal + tax + tripFee;
 
     // 8) Build PDF
-    const pdfBuffer = await buildEstimatePdf({ job, lines, totals: { subtotal, tax, tripFee, total } });
+    const pdfBuffer = await buildEstimatePdf({
+      job,
+      lines,
+      totals: { subtotal, tax, tripFee, total },
+    });
 
     // 9) Email via SendGrid
     await sgMail.send({
@@ -236,17 +290,43 @@ export default async function handler(req, res) {
           content: pdfBuffer.toString("base64"),
           filename: `Estimate_${job.id}.pdf`,
           type: "application/pdf",
-          disposition: "attachment"
-        }
-      ]
+          disposition: "attachment",
+        },
+      ],
     });
 
     // 10) Mark done
     await supabase.from("estimate_jobs").update({ status: "done", result_pdf_url: null }).eq("id", job.id);
 
-    return res.status(200).json({ ok: true, processed: job.id, emailed: job.email, lineCount: lines.length });
+    return res.status(200).json({
+      ok: true,
+      processed: job.id,
+      emailed: job.email,
+      extractedCount: extracted.length,
+      matchedLineCount: lines.length,
+      total: Number(total.toFixed(2)),
+    });
   } catch (err) {
     console.error("process-job error:", err);
+
+    // Best-effort: mark the oldest processing job as failed (optional)
+    try {
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+      const { data: processing } = await supabase
+        .from("estimate_jobs")
+        .select("id")
+        .eq("status", "processing")
+        .order("created_at", { ascending: true })
+        .limit(1);
+
+      if (processing?.length) {
+        await supabase
+          .from("estimate_jobs")
+          .update({ status: "failed", error: err?.message || "Server error" })
+          .eq("id", processing[0].id);
+      }
+    } catch {}
+
     return res.status(500).json({ ok: false, error: err?.message || "Server error" });
   }
 }
