@@ -12,4 +12,12 @@
     "react-dom": "18.2.0",
     "@supabase/supabase-js": "^2.49.0"
   }
+{
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "@sendgrid/mail": "^8.1.3",
+    "openai": "^4.0.0",
+    "xlsx": "^0.18.5",
+    "pdfkit": "^0.15.0"
+  }
 }
