@@ -1,20 +1,24 @@
 // pages/api/process-job.js
 //
-// UPDATED DEBUGGABLE WORKER
-// - Processes ONE estimate job per request
-// - Claims queued (or reclaims stale processing/ai_started)
-// - Extracts PDF text (pdf-parse)
-// - Calls OpenAI Responses API with JSON mode via text.format
-// - Emails estimate to customer + BINSR@dignhomes.com (SendGrid)
-// - Writes status/timestamps/errors so jobs don't get stuck
-// - Returns detailed error JSON (temporarily) to diagnose 500s quickly
+// UPDATED DEBUGGABLE WORKER (FIXED)
+// - Normalizes status casing/spacing issues
+// - Optionally skips INSPECTION to avoid OpenAI timeouts
+// - Writes email_error on SendGrid failures
+// - Reclaims stale processing/ai_started jobs
+// - Returns detailed debug JSON on errors
 //
-// REQUIRED Vercel env vars (set for BOTH Production + Preview if using preview URLs):
+// REQUIRED Vercel env vars (Production + Preview if you use preview URLs):
 //   SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
 //   OPENAI_API_KEY
 //   SENDGRID_API_KEY
 //   EMAIL_FROM
+//
+// OPTIONAL env vars:
+//   INCLUDE_INSPECTION        (default "false")  -> set to "true" to include inspection PDF
+//   MAX_PROMPT_CHARS          (default 40000)
+//   STALE_MINUTES             (default 20)
+//   OPENAI_TIMEOUT_MS         (default 120000)
 //
 // Dependencies:
 //   npm i pdf-parse openai @supabase/supabase-js @sendgrid/mail
@@ -28,11 +32,12 @@ import sgMail from "@sendgrid/mail";
 
 const INTERNAL_COPY_EMAIL = "BINSR@dignhomes.com";
 
-const MAX_PROMPT_CHARS = 40000;
 const FETCH_TIMEOUT_MS = 30000;
 
+const INCLUDE_INSPECTION = String(process.env.INCLUDE_INSPECTION || "false").toLowerCase() === "true";
+const MAX_PROMPT_CHARS = Number(process.env.MAX_PROMPT_CHARS || 40000);
 const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);
-const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 90000);
+const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
 
 function nowIso() {
   return new Date().toISOString();
@@ -167,25 +172,30 @@ async function withTimeout(promise, ms, label = "operation") {
   }
 }
 
+// Status variants seen in the wild (case/spacing)
+const QUEUED_VARIANTS = ["queued", "Queued", "QUEUED"];
+const PROCESSING_VARIANTS = ["processing", "Processing", "PROCESSING"];
+const AI_STARTED_VARIANTS = ["ai_started", "AI_STARTED", "Ai_Started", "ai-started", "AI-STARTED"];
+const FAILED_VARIANTS = ["failed", "Failed", "FAILED"];
+
 async function claimJob(supabase) {
-  // queued first
+  // 1) queued first (case variants)
   const { data: queued, error: qErr } = await supabase
     .from("estimate_jobs")
     .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at,ai_started_at,created_at")
-    .eq("status", "queued")
+    .in("status", QUEUED_VARIANTS)
     .order("created_at", { ascending: true })
     .limit(1);
 
   if (qErr) throw new Error(`DB pick queued failed: ${qErr.message}`);
   if (queued?.length) return queued[0];
 
-  // reclaim stale processing / ai_started
+  // 2) reclaim stale processing/ai_started
   const staleCutoff = new Date(Date.now() - STALE_MINUTES * 60 * 1000).toISOString();
-
   const { data: stale, error: sErr } = await supabase
     .from("estimate_jobs")
     .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at,ai_started_at,created_at")
-    .in("status", ["processing", "ai_started"])
+    .in("status", [...PROCESSING_VARIANTS, ...AI_STARTED_VARIANTS])
     .or(`started_at.lt.${staleCutoff},ai_started_at.lt.${staleCutoff}`)
     .order("created_at", { ascending: true })
     .limit(1);
@@ -202,6 +212,10 @@ export default async function handler(req, res) {
     env: {
       VERCEL_ENV: process.env.VERCEL_ENV,
       VERCEL_URL: process.env.VERCEL_URL,
+      INCLUDE_INSPECTION,
+      MAX_PROMPT_CHARS,
+      STALE_MINUTES,
+      OPENAI_TIMEOUT_MS,
     },
     steps: [],
   };
@@ -232,19 +246,30 @@ export default async function handler(req, res) {
     currentJobId = job.id;
     debug.jobId = job.id;
 
+    // Claim + mark processing (always write lowercase)
     debug.steps.push("mark_processing");
-    await supabase.from("estimate_jobs").update({
-      status: "processing",
-      started_at: nowIso(),
-      error: null,
-    }).eq("id", job.id);
+    await supabase
+      .from("estimate_jobs")
+      .update({
+        status: "processing",
+        started_at: nowIso(),
+        error: null,
+        email_error: null,
+      })
+      .eq("id", job.id);
 
     console.log("PROCESS_JOB_START", job.id);
 
+    // Build sources
     debug.steps.push("fetch_parse_pdfs");
     const sources = [];
     if (job.binsr_url) sources.push({ label: "BINSR", url: job.binsr_url });
-    if (job.inspection_url) sources.push({ label: "INSPECTION", url: job.inspection_url });
+
+    // Toggle inspection by env var; default false to reduce timeouts
+    if (INCLUDE_INSPECTION && job.inspection_url) {
+      sources.push({ label: "INSPECTION", url: job.inspection_url });
+    }
+
     if (!sources.length) throw new Error("Job has no PDF URLs (binsr_url/inspection_url)");
 
     let combined = "";
@@ -252,16 +277,19 @@ export default async function handler(req, res) {
       console.log("FETCH_PDF", job.id, s.label);
       const txt = await pdfTextFromUrl(s.url);
       combined += `\n\n===== ${s.label} TEXT START =====\n${txt}\n===== ${s.label} TEXT END =====\n`;
-      // tiny pause reduces bursty CPU on some serverless runs
-      await sleep(50);
+      await sleep(25);
     }
     combined = clampText(combined);
 
+    // AI start
     debug.steps.push("mark_ai_started");
-    await supabase.from("estimate_jobs").update({
-      status: "ai_started",
-      ai_started_at: nowIso(),
-    }).eq("id", job.id);
+    await supabase
+      .from("estimate_jobs")
+      .update({
+        status: "ai_started",
+        ai_started_at: nowIso(),
+      })
+      .eq("id", job.id);
 
     console.log("AI_START", job.id);
 
@@ -322,17 +350,21 @@ Return STRICT JSON with this structure:
     }
 
     debug.steps.push("save_estimate_complete");
-    await supabase.from("estimate_jobs").update({
-      status: "complete",
-      ai_completed_at: nowIso(),
-      completed_at: nowIso(),
-      estimate_json: estimateJson,
-      estimate_text: JSON.stringify(estimateJson, null, 2),
-      error: null,
-    }).eq("id", job.id);
+    await supabase
+      .from("estimate_jobs")
+      .update({
+        status: "complete",
+        ai_completed_at: nowIso(),
+        completed_at: nowIso(),
+        estimate_json: estimateJson,
+        estimate_text: JSON.stringify(estimateJson, null, 2),
+        error: null,
+      })
+      .eq("id", job.id);
 
     console.log("AI_DONE", job.id);
 
+    // Email
     debug.steps.push("send_email");
     sgMail.setApiKey(sendgridKey);
 
@@ -340,41 +372,68 @@ Return STRICT JSON with this structure:
     const subject = `BINSR Pros Estimate - Job ${job.id}`;
     const html = buildEmailHtml(job, estimateJson);
 
-    await sgMail.send({
-      to: toList,
-      from: emailFrom,
-      subject,
-      html,
-    });
+    try {
+      await sgMail.send({
+        to: toList,
+        from: emailFrom,
+        subject,
+        html,
+      });
 
-    debug.steps.push("mark_email_sent");
-    await supabase.from("estimate_jobs").update({
-      email_sent_at: nowIso(),
-      email_error: null,
-    }).eq("id", job.id);
+      debug.steps.push("mark_email_sent");
+      await supabase
+        .from("estimate_jobs")
+        .update({
+          email_sent_at: nowIso(),
+          email_error: null,
+        })
+        .eq("id", job.id);
 
-    console.log("EMAIL_SENT", job.id, toList);
+      console.log("EMAIL_SENT", job.id, toList);
+    } catch (mailErr) {
+      // Keep estimate complete, but record email error
+      const msg = String(mailErr?.message || mailErr);
+      await supabase
+        .from("estimate_jobs")
+        .update({
+          email_error: msg,
+        })
+        .eq("id", job.id);
+
+      console.error("EMAIL_FAILED", job.id, msg);
+
+      // Still return 200 since estimate is done (email can be retried)
+      return res.status(200).json({
+        ok: true,
+        jobId: job.id,
+        emailed: false,
+        email_error: msg,
+        debug,
+      });
+    }
 
     return res.status(200).json({ ok: true, jobId: job.id, emailed: toList, debug });
   } catch (e) {
     console.error("process-job error:", e);
 
-    // best effort: mark failed
+    // best effort: mark failed using lowercase "failed"
     try {
       if (currentJobId) {
         const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
           auth: { persistSession: false },
         });
-        await supabase.from("estimate_jobs").update({
-          status: "failed",
-          error: String(e?.message || e),
-        }).eq("id", currentJobId);
+        await supabase
+          .from("estimate_jobs")
+          .update({
+            status: "failed",
+            error: String(e?.message || e),
+          })
+          .eq("id", currentJobId);
       }
     } catch (inner) {
       console.error("Failed to mark job failed:", inner);
     }
 
-    // TEMP: return stack to diagnose 500s quickly
     return res.status(500).json({
       ok: false,
       error: String(e?.message || e),
