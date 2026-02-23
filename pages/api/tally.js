@@ -4,23 +4,14 @@ import { createClient } from "@supabase/supabase-js";
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  // ✅ Always acknowledge Tally immediately (prevents webhook failures)
+  // Always acknowledge Tally immediately
   res.status(200).json({ ok: true });
 
-  // Everything below runs best-effort; errors will show in Vercel logs but won't fail Tally
   try {
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-    if (!supabaseUrl || !supabaseKey) {
-      console.error("Missing SUPABASE env vars", {
-        hasSUPABASE_URL: !!supabaseUrl,
-        hasSUPABASE_SERVICE_ROLE_KEY: !!supabaseKey,
-      });
-      return;
-    }
-
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY
+    );
 
     const fields = req.body?.data?.fields || [];
     const byLabel = (label) =>
@@ -33,7 +24,9 @@ export default async function handler(req, res) {
     const notes = byLabel("Additional Information")?.value || "";
 
     const binsrUrl = ((byLabel("BINSR")?.value || [])[0] || {})?.url || null;
-    const inspUrl = ((byLabel("Inspection Report")?.value || [])[0] || {})?.url || null;
+    const inspectionUrl = ((byLabel("Inspection Report")?.value || [])[0] || {})?.url || null;
+
+    console.log("Tally fields parsed:", { email, binsrUrl: !!binsrUrl, inspectionUrl: !!inspectionUrl });
 
     const { data, error } = await supabase
       .from("estimate_jobs")
@@ -44,10 +37,12 @@ export default async function handler(req, res) {
         phone,
         notes,
         binsr_url: binsrUrl,
-        inspection_url: inspUrl,
+        inspection_url: inspectionUrl,
       })
       .select("id")
       .single();
+
+    console.log("Supabase insert result:", { data, error });
 
     if (error) {
       console.error("Supabase insert error:", error);
