@@ -2,28 +2,26 @@
 import { createClient } from "@supabase/supabase-js";
 
 export default async function handler(req, res) {
-  // ✅ Browsers hit this with GET — always return 405
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
+  // ✅ Always acknowledge Tally immediately (prevents webhook failures)
+  res.status(200).json({ ok: true });
+
+  // Everything below runs best-effort; errors will show in Vercel logs but won't fail Tally
   try {
-    // ✅ Validate env vars (prevents confusing 500s)
     const supabaseUrl = process.env.SUPABASE_URL;
     const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
     if (!supabaseUrl || !supabaseKey) {
-      console.error("Missing env vars:", {
+      console.error("Missing SUPABASE env vars", {
         hasSUPABASE_URL: !!supabaseUrl,
         hasSUPABASE_SERVICE_ROLE_KEY: !!supabaseKey,
       });
-      return res
-        .status(500)
-        .json({ ok: false, error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" });
+      return;
     }
 
-    // ✅ Create Supabase client INSIDE handler (prevents GET 500)
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Tally payload structure: req.body.data.fields[]
     const fields = req.body?.data?.fields || [];
     const byLabel = (label) =>
       fields.find((f) => (f?.label || "").toLowerCase() === label.toLowerCase());
@@ -34,20 +32,8 @@ export default async function handler(req, res) {
     const phone = byLabel("Phone")?.value || "";
     const notes = byLabel("Additional Information")?.value || "";
 
-    const binsrFile = (byLabel("BINSR")?.value || [])[0] || null;
-    const inspFile = (byLabel("Inspection Report")?.value || [])[0] || null;
-
-    const binsrUrl = binsrFile?.url || null;
-    const inspectionUrl = inspFile?.url || null;
-
-    if (!email) {
-      return res.status(400).json({ ok: false, error: "Missing Email field" });
-    }
-    if (!binsrUrl && !inspectionUrl) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing uploads (BINSR or Inspection Report)" });
-    }
+    const binsrUrl = ((byLabel("BINSR")?.value || [])[0] || {})?.url || null;
+    const inspUrl = ((byLabel("Inspection Report")?.value || [])[0] || {})?.url || null;
 
     const { data, error } = await supabase
       .from("estimate_jobs")
@@ -58,21 +44,18 @@ export default async function handler(req, res) {
         phone,
         notes,
         binsr_url: binsrUrl,
-        inspection_url: inspectionUrl,
+        inspection_url: inspUrl,
       })
       .select("id")
       .single();
 
     if (error) {
       console.error("Supabase insert error:", error);
-      throw error;
+      return;
     }
 
-    console.log("Queued estimate job:", data.id, email);
-
-    return res.status(200).json({ ok: true, job_id: data.id });
+    console.log("✅ Queued estimate job:", data.id, email);
   } catch (err) {
-    console.error("Webhook error:", err);
-    return res.status(500).json({ ok: false, error: err?.message || "Server error" });
+    console.error("Webhook processing error:", err);
   }
 }
