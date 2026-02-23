@@ -5,6 +5,7 @@
 // - Downloads PDFs from Tally URLs
 // - Extracts text with pdf-parse
 // - Calls OpenAI with TEXT ONLY (no file_data)
+// - Uses Responses API JSON mode via text.format
 // - Saves estimate_json + status timestamps
 // - Never leaves jobs stuck in "processing"
 //
@@ -61,7 +62,7 @@ async function claimJob(supabase) {
   // 1) Try queued first
   const { data: queued, error: qErr } = await supabase
     .from("estimate_jobs")
-    .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at")
+    .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at,created_at")
     .eq("status", "queued")
     .order("created_at", { ascending: true })
     .limit(1);
@@ -74,7 +75,7 @@ async function claimJob(supabase) {
 
   const { data: stale, error: sErr } = await supabase
     .from("estimate_jobs")
-    .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at")
+    .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at,created_at")
     .eq("status", "processing")
     .lt("started_at", staleCutoff)
     .order("started_at", { ascending: true })
@@ -87,6 +88,8 @@ async function claimJob(supabase) {
 }
 
 export default async function handler(req, res) {
+  let currentJobId = null;
+
   try {
     const supabaseUrl = process.env.SUPABASE_URL;
     const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -110,7 +113,9 @@ export default async function handler(req, res) {
     const job = await claimJob(supabase);
     if (!job) return res.status(200).json({ ok: true, message: "No queued jobs" });
 
-    // Mark as processing + timestamp (this is critical)
+    currentJobId = job.id;
+
+    // Mark as processing + timestamp
     await supabase
       .from("estimate_jobs")
       .update({ status: "processing", started_at: nowIso(), error: null })
@@ -177,21 +182,20 @@ Return STRICT JSON with this structure:
 }
 `;
 
+    // ✅ Updated for Responses API: response_format -> text.format
     const resp = await openai.responses.create({
       model: "gpt-5-mini",
       input: prompt,
-      response_format: { type: "json_object" },
+      text: { format: { type: "json_object" } },
     });
 
-    const textOut =
-      resp.output?.[0]?.content?.find((c) => c.type === "output_text")?.text ?? null;
-
+    const textOut = resp.output_text;
     if (!textOut) throw new Error("OpenAI response missing output_text");
 
     let estimateJson;
     try {
       estimateJson = JSON.parse(textOut);
-    } catch (e) {
+    } catch {
       throw new Error("Failed to parse OpenAI JSON output");
     }
 
@@ -214,8 +218,21 @@ Return STRICT JSON with this structure:
   } catch (e) {
     console.error("process-job error:", e);
 
-    // Best effort: if we have a jobId in logs/flow, you can enhance this by tracking jobId in scope.
-    // For now we return error. If you want, I can add a scoped jobId to always mark failed.
+    // Best effort: mark job failed if we already claimed one
+    try {
+      if (currentJobId) {
+        const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { persistSession: false },
+        });
+        await supabase
+          .from("estimate_jobs")
+          .update({ status: "failed", error: String(e?.message || e) })
+          .eq("id", currentJobId);
+      }
+    } catch (inner) {
+      console.error("Failed to mark job failed:", inner);
+    }
+
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
