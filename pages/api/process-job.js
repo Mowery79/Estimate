@@ -1,4 +1,5 @@
 // pages/api/process-job.js
+export const config = { runtime: "nodejs" };
 import fs from "fs/promises";
 import path from "path";
 import PDFDocument from "pdfkit";
