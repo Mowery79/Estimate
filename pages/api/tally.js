@@ -4,7 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  // Always acknowledge Tally immediately
+  // Return 200 to Tally immediately
   res.status(200).json({ ok: true });
 
   try {
@@ -23,8 +23,11 @@ export default async function handler(req, res) {
     const phone = byLabel("Phone")?.value || "";
     const notes = byLabel("Additional Information")?.value || "";
 
-    const binsrUrl = ((byLabel("BINSR")?.value || [])[0] || {})?.url || null;
-    const inspectionUrl = ((byLabel("Inspection Report")?.value || [])[0] || {})?.url || null;
+    const binsrVal = byLabel("BINSR")?.value;
+    const inspVal = byLabel("Inspection Report")?.value;
+
+    const binsrUrl = Array.isArray(binsrVal) ? binsrVal?.[0]?.url : null;
+    const inspectionUrl = Array.isArray(inspVal) ? inspVal?.[0]?.url : null;
 
     console.log("Tally fields parsed:", { email, binsrUrl: !!binsrUrl, inspectionUrl: !!inspectionUrl });
 
@@ -37,19 +40,15 @@ export default async function handler(req, res) {
         phone,
         notes,
         binsr_url: binsrUrl,
-        inspection_url: inspectionUrl,
+        inspection_url: inspectionUrl
       })
       .select("id")
       .single();
 
     console.log("Supabase insert result:", { data, error });
+    if (error) console.error("Supabase insert error:", error);
 
-    if (error) {
-      console.error("Supabase insert error:", error);
-      return;
-    }
-
-    console.log("✅ Queued estimate job:", data.id, email);
+    if (!error) console.log("✅ Queued estimate job:", data.id, email);
   } catch (err) {
     console.error("Webhook processing error:", err);
   }
