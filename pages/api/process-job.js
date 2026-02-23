@@ -1,3 +1,4 @@
+// pages/api/process-job.js
 import fs from "fs/promises";
 import path from "path";
 import PDFDocument from "pdfkit";
@@ -6,7 +7,11 @@ import sgMail from "@sendgrid/mail";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
-/** Download a URL (Tally private URL with token) to /tmp */
+/**
+ * ================
+ * Helpers: Downloads
+ * ================
+ */
 async function downloadToTmp(fileUrl, filename) {
   const resp = await fetch(fileUrl);
   if (!resp.ok) throw new Error(`Download failed ${resp.status}: ${resp.statusText}`);
@@ -16,7 +21,6 @@ async function downloadToTmp(fileUrl, filename) {
   return filePath;
 }
 
-/** Download Supabase Storage file to /tmp */
 async function downloadPricebookToTmp(supabase) {
   const { data, error } = await supabase.storage.from("pricebooks").download("active.xlsx");
   if (error) throw error;
@@ -28,30 +32,90 @@ async function downloadPricebookToTmp(supabase) {
   return tmpPath;
 }
 
-/** Load PRICEBOOK + ALIASES TABLE into lookup maps */
+/**
+ * ==========================
+ * Helpers: Sheet/tab detection
+ * ==========================
+ * This makes the code resilient to:
+ * - casing differences ("Pricebook" vs "PRICEBOOK")
+ * - trailing/leading whitespace ("PRICEBOOK ")
+ * - hidden unicode whitespace
+ */
+function normName(s) {
+  return String(s || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function getSheetByNameLoose(wb, wanted) {
+  const target = normName(wanted);
+  const matchName = wb.SheetNames.find((n) => normName(n) === target);
+  return matchName ? { name: matchName, sheet: wb.Sheets[matchName] } : null;
+}
+
+// Optional fallback: detect sheet by header keywords
+function findSheetByHeaderHints(wb, requiredHintsLower) {
+  for (const name of wb.SheetNames) {
+    const ws = wb.Sheets[name];
+    const rows = xlsx.utils.sheet_to_json(ws, { header: 1, defval: "" });
+    const header = (rows[0] || []).map((h) => normName(h));
+    const ok = requiredHintsLower.every((h) => header.includes(normName(h)));
+    if (ok) return { name, sheet: ws };
+  }
+  return null;
+}
+
+/**
+ * ==========================
+ * Helpers: Pricebook + Aliases
+ * ==========================
+ */
 function loadPricebookAndAliases(pricebookPath) {
   const wb = xlsx.readFile(pricebookPath);
 
-  const pbSheet = wb.Sheets["PRICEBOOK"];
-  const aliasSheet = wb.Sheets["ALIASES TABLE"];
-  if (!pbSheet) throw new Error("PRICEBOOK sheet not found in active.xlsx");
-  if (!aliasSheet) throw new Error("ALIASES TABLE sheet not found in active.xlsx");
+  // Try exact-ish names first (loose)
+  let pbHit = getSheetByNameLoose(wb, "PRICEBOOK");
+  let alHit = getSheetByNameLoose(wb, "ALIASES TABLE");
 
-  const pricebookRows = xlsx.utils.sheet_to_json(pbSheet, { defval: "" });
-  const aliasRows = xlsx.utils.sheet_to_json(aliasSheet, { defval: "" });
+  // Fallback: detect by header hints
+  if (!pbHit) {
+    pbHit = findSheetByHeaderHints(wb, ["item id", "price"]);
+  }
+  if (!alHit) {
+    alHit = findSheetByHeaderHints(wb, ["alias", "item id"]);
+  }
+
+  if (!pbHit) {
+    throw new Error(
+      `PRICEBOOK sheet not found. Found sheets: ${wb.SheetNames.join(", ")}`
+    );
+  }
+  if (!alHit) {
+    throw new Error(
+      `ALIASES TABLE sheet not found. Found sheets: ${wb.SheetNames.join(", ")}`
+    );
+  }
+
+  const pbRows = xlsx.utils.sheet_to_json(pbHit.sheet, { defval: "" });
+  const aliasRows = xlsx.utils.sheet_to_json(alHit.sheet, { defval: "" });
 
   const pbById = new Map();
-  for (const row of pricebookRows) {
-    const id = String(row["ITEM ID"] || row["ITEMID"] || "").trim();
-    if (!id) continue;
-    pbById.set(id, row);
+  for (const row of pbRows) {
+    const id = String(row["ITEM ID"] || row["ITEMID"] || row["ItemID"] || "").trim();
+    if (id) pbById.set(id, row);
   }
 
   const aliasMap = [];
   for (const a of aliasRows) {
-    // Adjust these keys if your alias sheet uses different column names
     const aliasText = String(
-      a["ALIAS"] || a["Alias"] || a["ALIAS TEXT"] || a["AliasText"] || ""
+      a["ALIAS"] ||
+        a["Alias"] ||
+        a["ALIAS TEXT"] ||
+        a["AliasText"] ||
+        a["ALIASTEXT"] ||
+        ""
     )
       .trim()
       .toLowerCase();
@@ -62,13 +126,18 @@ function loadPricebookAndAliases(pricebookPath) {
     aliasMap.push({ aliasText, itemId });
   }
 
-  // Match longer aliases first
+  // Prefer longer aliases first
   aliasMap.sort((x, y) => y.aliasText.length - x.aliasText.length);
 
-  return { pbById, aliasMap };
+  return {
+    sheetNames: wb.SheetNames,
+    pricebookSheetName: pbHit.name,
+    aliasSheetName: alHit.name,
+    pbById,
+    aliasMap,
+  };
 }
 
-/** Simple substring alias matching */
 function matchItemIdByAlias(aliasMap, text) {
   const t = (text || "").toLowerCase();
   for (const a of aliasMap) {
@@ -77,7 +146,11 @@ function matchItemIdByAlias(aliasMap, text) {
   return null;
 }
 
-/** OpenAI: extract repair items as strict JSON {items:[{text,qty}]} */
+/**
+ * ==========================
+ * OpenAI: extract repair items
+ * ==========================
+ */
 async function extractRepairsWithOpenAI(pdfPath) {
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
@@ -94,16 +167,12 @@ async function extractRepairsWithOpenAI(pdfPath) {
           {
             type: "input_text",
             text:
-              "You are extracting repair/defect items from a BINSR or home inspection report. " +
+              "Extract repair/defect items from this BINSR or inspection report. " +
               "Return only items that require repair/correction. " +
               "Keep each item concise. If quantity is unclear, set qty=1. " +
-              "Do not include general disclaimers, maintenance tips, or purely informational notes.",
+              "Ignore general disclaimers and informational text.",
           },
-          {
-            type: "input_file",
-            filename: path.basename(pdfPath),
-            file_data: base64,
-          },
+          { type: "input_file", filename: path.basename(pdfPath), file_data: base64 },
         ],
       },
     ],
@@ -139,7 +208,11 @@ async function extractRepairsWithOpenAI(pdfPath) {
   return parsed.items || [];
 }
 
-/** Build a simple PDF estimate buffer */
+/**
+ * ==========================
+ * PDF generation
+ * ==========================
+ */
 function buildEstimatePdf({ job, lines, totals }) {
   return new Promise((resolve) => {
     const doc = new PDFDocument({ margin: 40 });
@@ -152,7 +225,7 @@ function buildEstimatePdf({ job, lines, totals }) {
 
     doc.fontSize(10).text(`Estimate ID: ${job.id}`);
     doc.text(`Generated: ${new Date().toLocaleString()}`);
-    doc.text(`Agent: ${job.name || ""}  |  ${job.email || ""}`);
+    doc.text(`Agent: ${job.name || ""} | ${job.email || ""}`);
     if (job.phone) doc.text(`Phone: ${job.phone}`);
     if (job.notes) doc.text(`Notes: ${job.notes}`);
     doc.moveDown();
@@ -169,9 +242,9 @@ function buildEstimatePdf({ job, lines, totals }) {
       for (const ln of lines) {
         doc.text(`${ln.itemId} — ${ln.itemName}`);
         doc.text(
-          `Qty: ${ln.qty}  Unit: ${ln.unit}  Unit Price: $${ln.unitPrice.toFixed(2)}  Line: $${ln.lineTotal.toFixed(
+          `Qty: ${ln.qty}  Unit: ${ln.unit}  Unit Price: $${ln.unitPrice.toFixed(
             2
-          )}`
+          )}  Line: $${ln.lineTotal.toFixed(2)}`
         );
         if (ln.description) doc.text(`Scope: ${ln.description}`);
         doc.moveDown(0.6);
@@ -190,10 +263,21 @@ function buildEstimatePdf({ job, lines, totals }) {
   });
 }
 
+/**
+ * ==========================
+ * Main handler
+ * ==========================
+ */
 export default async function handler(req, res) {
   try {
-    // Validate required env vars
-    const required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "OPENAI_API_KEY", "SENDGRID_API_KEY", "FROM_EMAIL"];
+    // Required env vars
+    const required = [
+      "SUPABASE_URL",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "OPENAI_API_KEY",
+      "SENDGRID_API_KEY",
+      "FROM_EMAIL",
+    ];
     for (const k of required) {
       if (!process.env[k]) return res.status(500).json({ ok: false, error: `Missing env var ${k}` });
     }
@@ -202,11 +286,12 @@ export default async function handler(req, res) {
 
     const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-    // 1) Get oldest queued job
+    // Get oldest queued job WITH at least one URL
     const { data: jobs, error: qErr } = await supabase
       .from("estimate_jobs")
       .select("*")
       .eq("status", "queued")
+      .or("binsr_url.not.is.null,inspection_url.not.is.null")
       .order("created_at", { ascending: true })
       .limit(1);
 
@@ -215,32 +300,38 @@ export default async function handler(req, res) {
 
     const job = jobs[0];
 
-    // 2) Mark processing
+    // Mark processing
     await supabase.from("estimate_jobs").update({ status: "processing", error: null }).eq("id", job.id);
 
-    // 3) Choose BINSR if present else Inspection
+    // BINSR preferred else inspection
     const sourceUrl = job.binsr_url || job.inspection_url;
-    if (!sourceUrl) throw new Error("Job has no binsr_url or inspection_url");
+    if (!sourceUrl) {
+      await supabase
+        .from("estimate_jobs")
+        .update({ status: "failed", error: "Missing binsr_url and inspection_url" })
+        .eq("id", job.id);
+      return res.status(200).json({ ok: true, skipped: job.id });
+    }
 
+    // Download report + pricebook
     const reportPath = await downloadToTmp(sourceUrl, `report-${job.id}.pdf`);
-
-    // 4) Download pricebook from Supabase Storage
     const pricebookPath = await downloadPricebookToTmp(supabase);
 
-    // 5) Load pricebook + aliases
-    const { pbById, aliasMap } = loadPricebookAndAliases(pricebookPath);
+    // Load pricebook + aliases with robust tab detection
+    const { sheetNames, pricebookSheetName, aliasSheetName, pbById, aliasMap } =
+      loadPricebookAndAliases(pricebookPath);
 
-    // 6) Extract repair items with OpenAI
+    // Extract repairs via OpenAI
     const extracted = await extractRepairsWithOpenAI(reportPath);
 
-    // 7) Match + price
+    // Match + price
     const lines = [];
     for (const it of extracted) {
       const rawText = it.text || "";
       const qty = Number(it.qty || 1) || 1;
 
       const itemId = matchItemIdByAlias(aliasMap, rawText);
-      if (!itemId) continue; // MVP: skip unmatched (later: mark REVIEW)
+      if (!itemId) continue;
 
       const pb = pbById.get(itemId);
       if (!pb) continue;
@@ -261,21 +352,17 @@ export default async function handler(req, res) {
       });
     }
 
-    // Totals (replace with tblSettings/tblTripFees later)
+    // Totals (swap in SETTINGS/TRIPFEES later)
     const subtotal = lines.reduce((s, l) => s + l.lineTotal, 0);
     const taxRate = 0.112;
     const tax = subtotal * taxRate;
     const tripFee = 0;
     const total = subtotal + tax + tripFee;
 
-    // 8) Build PDF
-    const pdfBuffer = await buildEstimatePdf({
-      job,
-      lines,
-      totals: { subtotal, tax, tripFee, total },
-    });
+    // Build PDF
+    const pdfBuffer = await buildEstimatePdf({ job, lines, totals: { subtotal, tax, tripFee, total } });
 
-    // 9) Email via SendGrid
+    // Send email
     await sgMail.send({
       to: job.email,
       from: process.env.FROM_EMAIL,
@@ -295,7 +382,7 @@ export default async function handler(req, res) {
       ],
     });
 
-    // 10) Mark done
+    // Mark done
     await supabase.from("estimate_jobs").update({ status: "done", result_pdf_url: null }).eq("id", job.id);
 
     return res.status(200).json({
@@ -305,28 +392,12 @@ export default async function handler(req, res) {
       extractedCount: extracted.length,
       matchedLineCount: lines.length,
       total: Number(total.toFixed(2)),
+      pricebookSheetUsed: pricebookSheetName,
+      aliasSheetUsed: aliasSheetName,
+      sheetNamesFound: sheetNames,
     });
   } catch (err) {
     console.error("process-job error:", err);
-
-    // Best-effort: mark the oldest processing job as failed (optional)
-    try {
-      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-      const { data: processing } = await supabase
-        .from("estimate_jobs")
-        .select("id")
-        .eq("status", "processing")
-        .order("created_at", { ascending: true })
-        .limit(1);
-
-      if (processing?.length) {
-        await supabase
-          .from("estimate_jobs")
-          .update({ status: "failed", error: err?.message || "Server error" })
-          .eq("id", processing[0].id);
-      }
-    } catch {}
-
     return res.status(500).json({ ok: false, error: err?.message || "Server error" });
   }
 }
