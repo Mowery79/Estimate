@@ -28,7 +28,7 @@ import sgMail from "@sendgrid/mail";
 
 const INTERNAL_COPY_EMAIL = "BINSR@dignhomes.com";
 
-const MAX_PROMPT_CHARS = 120000;
+const MAX_PROMPT_CHARS = 40000;
 const FETCH_TIMEOUT_MS = 30000;
 
 const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);
