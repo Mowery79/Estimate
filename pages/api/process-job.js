@@ -414,7 +414,7 @@ RULES:
 ${rulesText || "(none)"}
 
 PRICEBOOK:
-${JSON.stringify(shortlist.length ? shortlist : config.pricebook.slice(0, 150))}
+${JSON.stringify(shortlist.length ? shortlist : config.pricebook.slice(0, 500))}
 
 EXTRACTED ITEMS:
 ${JSON.stringify(extractedItems)}
