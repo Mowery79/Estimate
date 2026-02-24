@@ -1,11 +1,12 @@
 // pages/api/process-job.js
 //
-// PRICEBOOK-ENFORCED WORKER (NEWEST)
-// - Uses Supabase as source of truth for PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES
-// - 2-stage AI: extract items -> map to codes (NO pricing)
+// PRICEBOOK + TEMPLATE ENFORCED WORKER (CORRECTED)
+// - Supabase is source of truth for: PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES
+// - 2-stage AI: extract items -> map to codes (NO pricing, NO tax)
 // - Pricing enforced in code from pricebook_items (model cannot invent pricing)
 // - Trip fee applied from trip_fees (requires pricebook code TRIP_FEE)
-// - Emails estimate to customer + BINSR@dignhomes.com (SendGrid)
+// - Tax computed in code from rule TAX_RATE (fallback 0.112)
+// - Email HTML rendered from templates.body_html (placeholders replaced)
 // - Debuggable response with steps + stack on failure
 //
 // REQUIRED Vercel env vars:
@@ -20,6 +21,7 @@
 //   MAX_PDF_TEXT_CHARS        (default 35000)    -> limits PDF text fed to AI
 //   STALE_MINUTES             (default 20)
 //   OPENAI_TIMEOUT_MS         (default 120000)
+//   TAX_RATE_DEFAULT          (default 0.112)    -> fallback if no DB rule
 //
 // Dependencies:
 //   npm i pdf-parse openai @supabase/supabase-js @sendgrid/mail
@@ -34,10 +36,14 @@ import sgMail from "@sendgrid/mail";
 const INTERNAL_COPY_EMAIL = "BINSR@dignhomes.com";
 const FETCH_TIMEOUT_MS = 30000;
 
-const INCLUDE_INSPECTION = String(process.env.INCLUDE_INSPECTION || "false").toLowerCase() === "true";
+const INCLUDE_INSPECTION =
+  String(process.env.INCLUDE_INSPECTION || "false").toLowerCase() === "true";
 const MAX_PDF_TEXT_CHARS = Number(process.env.MAX_PDF_TEXT_CHARS || 35000);
 const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
+const TAX_RATE_DEFAULT = Number(process.env.TAX_RATE_DEFAULT || 0.112);
+
+const TEMPLATE_KEY_DEFAULT = "BINSR_PROS_REPAIR_ESTIMATE_V1";
 
 function nowIso() {
   return new Date().toISOString();
@@ -45,6 +51,7 @@ function nowIso() {
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
 async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -54,10 +61,12 @@ async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
     clearTimeout(t);
   }
 }
+
 function clamp(text, maxChars) {
   if (!text) return "";
   return text.length <= maxChars ? text : text.slice(0, maxChars) + "\n\n[TRUNCATED]";
 }
+
 async function pdfTextFromUrl(url) {
   const r = await fetchWithTimeout(url);
   if (!r.ok) throw new Error(`Failed to fetch PDF (${r.status}) from ${url}`);
@@ -65,6 +74,7 @@ async function pdfTextFromUrl(url) {
   const parsed = await pdf(buf);
   return parsed?.text || "";
 }
+
 async function withTimeout(promise, ms, label = "operation") {
   let t;
   const timeout = new Promise((_, reject) => {
@@ -82,53 +92,57 @@ function round2(n) {
 }
 
 function escapeHtml(str) {
-  return String(str)
+  return String(str ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
+
 function money(n) {
   const x = Number(n);
   if (!Number.isFinite(x)) return "";
   return x.toLocaleString(undefined, { style: "currency", currency: "USD" });
 }
 
-function buildEmailHtml(job, estimate) {
-  const items = Array.isArray(estimate?.line_items) ? estimate.line_items : [];
-  const rows = items
-    .slice(0, 60)
+function normalize(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildLineItemsTableHtml(items) {
+  const rows = (items || [])
+    .slice(0, 80)
     .map((li) => {
-      const name = li?.name ?? li?.code ?? "";
-      const qty = li?.qty ?? "";
-      const unit = money(li?.unit_price);
-      const total = money(li?.total);
-      const desc = li?.description
-        ? `<div style="color:#555;font-size:12px;margin-top:2px;">${escapeHtml(li.description)}</div>`
-        : "";
       return `
         <tr>
           <td style="padding:8px;border-bottom:1px solid #eee;">
-            <strong>${escapeHtml(name)}</strong>${desc}
+            <strong>${escapeHtml(li?.name || li?.code || "")}</strong>
+            ${
+              li?.description
+                ? `<div style="color:#555;font-size:12px;margin-top:2px;">${escapeHtml(li.description)}</div>`
+                : ""
+            }
           </td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(String(qty))}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(unit)}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(total)}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(
+            String(li?.qty ?? "")
+          )}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(
+            money(li?.unit_price)
+          )}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(
+            money(li?.total)
+          )}</td>
         </tr>
       `;
     })
     .join("");
 
   return `
-  <div style="font-family:Arial,sans-serif;line-height:1.4;color:#111;">
-    <h2 style="margin:0 0 8px;">BINSR Pros — Repair Estimate</h2>
-    <div style="color:#555;margin-bottom:14px;">Job ID: ${escapeHtml(job.id)}</div>
-
-    <h3 style="margin:18px 0 6px;">Summary</h3>
-    <div style="white-space:pre-wrap;">${escapeHtml(String(estimate?.summary ?? ""))}</div>
-
-    <h3 style="margin:18px 0 6px;">Line Items</h3>
     <table style="width:100%;border-collapse:collapse;">
       <thead>
         <tr>
@@ -139,22 +153,88 @@ function buildEmailHtml(job, estimate) {
         </tr>
       </thead>
       <tbody>
-        ${rows || `<tr><td colspan="4" style="padding:8px;color:#555;">No line items returned.</td></tr>`}
+        ${
+          rows ||
+          `<tr><td colspan="4" style="padding:8px;color:#555;">No line items returned.</td></tr>`
+        }
       </tbody>
     </table>
-
-    <div style="margin-top:14px;text-align:right;">
-      <div>Subtotal: <strong>${escapeHtml(money(estimate?.subtotal))}</strong></div>
-      <div>Tax: <strong>${escapeHtml(money(estimate?.tax))}</strong></div>
-      <div style="font-size:18px;margin-top:6px;">Total: <strong>${escapeHtml(money(estimate?.total))}</strong></div>
-    </div>
-
-    <hr style="border:none;border-top:1px solid #eee;margin:18px 0;" />
-    <div style="color:#555;font-size:12px;">
-      This estimate uses BINSR Pros pricebook and rules.
-    </div>
-  </div>
   `;
+}
+
+function applyPlaceholders(templateHtml, ctx) {
+  // Keep placeholders simple and explicit.
+  // If you want more later, add here.
+  let html = String(templateHtml ?? "");
+
+  const pairs = [
+    ["{JobID}", ctx.jobId],
+    ["{EstimateID}", ctx.estimateId],
+    ["{PropertyAddress}", ctx.propertyAddress],
+    ["{AgentName}", ctx.agentName],
+    ["{ClientName}", ctx.clientName],
+    ["{Summary}", ctx.summary],
+    ["{LineItemsTable}", ctx.lineItemsTable],
+    ["{Subtotal}", money(ctx.subtotal)],
+    ["{TripFee}", money(ctx.tripFee)],
+    ["{Tax}", money(ctx.tax)],
+    ["{Total}", money(ctx.total)],
+    ["{TaxRate}", ctx.taxRate != null ? `${(ctx.taxRate * 100).toFixed(2)}%` : ""],
+  ];
+
+  for (const [k, v] of pairs) {
+    html = html.replaceAll(k, String(v ?? ""));
+  }
+
+  return html;
+}
+
+function buildFallbackEmailHtml(job, estimate) {
+  // Only used if no template exists in DB.
+  const rowsTable = buildLineItemsTableHtml(estimate?.line_items || []);
+  return `
+    <div style="font-family:Arial,sans-serif;line-height:1.4;color:#111;">
+      <h2 style="margin:0 0 8px;">BINSR Pros — Repair Estimate</h2>
+      <div style="color:#555;margin-bottom:14px;">Job ID: ${escapeHtml(job.id)}</div>
+
+      <h3 style="margin:18px 0 6px;">Summary</h3>
+      <div style="white-space:pre-wrap;">${escapeHtml(String(estimate?.summary ?? ""))}</div>
+
+      <h3 style="margin:18px 0 6px;">Line Items</h3>
+      ${rowsTable}
+
+      <div style="margin-top:14px;text-align:right;">
+        <div>Subtotal: <strong>${escapeHtml(money(estimate?.subtotal))}</strong></div>
+        <div>Trip Fee: <strong>${escapeHtml(money(estimate?.trip_fee ?? 0))}</strong></div>
+        <div>Tax: <strong>${escapeHtml(money(estimate?.tax))}</strong></div>
+        <div style="font-size:18px;margin-top:6px;">Total: <strong>${escapeHtml(
+          money(estimate?.total)
+        )}</strong></div>
+      </div>
+    </div>
+  `;
+}
+
+function buildEmailFromTemplate(job, estimate, templateRow) {
+  const ctx = {
+    jobId: job.id,
+    estimateId: estimate?.estimate_id || job.id,
+    propertyAddress: estimate?.property_address || "",
+    agentName: estimate?.agent_name || "",
+    clientName: estimate?.client_name || "",
+    summary: estimate?.summary || "",
+    lineItemsTable: buildLineItemsTableHtml(estimate?.line_items || []),
+    subtotal: estimate?.subtotal ?? 0,
+    tripFee: estimate?.trip_fee ?? 0,
+    tax: estimate?.tax ?? 0,
+    total: estimate?.total ?? 0,
+    taxRate: estimate?.tax_rate ?? null,
+  };
+
+  const subject =
+    String(templateRow?.subject || "").trim() || `BINSR Pros Estimate - Job ${job.id}`;
+  const html = applyPlaceholders(templateRow?.body_html, ctx);
+  return { subject, html };
 }
 
 // Status variants (case/spacing issues)
@@ -200,17 +280,15 @@ async function loadActiveConfig(supabase) {
 
   if (cfgErr || !cfg) throw new Error("No active config_versions row found.");
 
-  const [
-    pbRes,
-    aliasRes,
-    tripRes,
-    rulesRes,
-    tmplRes,
-  ] = await Promise.all([
+  const [pbRes, aliasRes, tripRes, rulesRes, tmplRes] = await Promise.all([
     supabase.from("pricebook_items").select("code,name,unit,unit_price,min_qty,notes").eq("active", true),
     supabase.from("aliases").select("alias,code").eq("active", true),
     supabase.from("trip_fees").select("label,base_fee,per_mile,after_hours_fee").eq("active", true),
-    supabase.from("estimate_rules").select("rule_key,rule_text,priority").eq("active", true).order("priority", { ascending: true }),
+    supabase
+      .from("estimate_rules")
+      .select("rule_key,rule_text,priority")
+      .eq("active", true)
+      .order("priority", { ascending: true }),
     supabase.from("templates").select("template_key,subject,body_html").eq("active", true),
   ]);
 
@@ -227,9 +305,24 @@ async function loadActiveConfig(supabase) {
   const templates = tmplRes.data || [];
 
   const pricebookMap = new Map(pricebook.map((p) => [p.code, p]));
-  const aliasMap = new Map(aliases.map((a) => [String(a.alias).toLowerCase(), a.code]));
+  const aliasMap = new Map(aliases.map((a) => [String(a.alias || "").toLowerCase(), a.code]));
 
   return { cfg, pricebook, pricebookMap, aliasMap, tripFees, rules, templates };
+}
+
+function getTaxRateFromRules(rules) {
+  // Look for a rule like: rule_key="TAX_RATE" and rule_text="0.112" (or "11.2%")
+  const r = (rules || []).find((x) => String(x.rule_key || "").toUpperCase() === "TAX_RATE");
+  if (!r) return TAX_RATE_DEFAULT;
+
+  const t = String(r.rule_text || "").trim();
+  // Try decimal first
+  const n = Number(t.replace("%", ""));
+  if (!Number.isFinite(n)) return TAX_RATE_DEFAULT;
+
+  // If it was "11.2%" interpret as percent
+  if (t.includes("%") || n > 1) return round2(n / 100);
+  return n; // already decimal like 0.112
 }
 
 function validateAndPrice(mapped, pricebookMap) {
@@ -243,18 +336,26 @@ function validateAndPrice(mapped, pricebookMap) {
     const code = String(li?.code || "").trim();
     const pb = pricebookMap.get(code);
     if (!pb) {
-      unmapped.push(li);
+      unmapped.push({ ...li, reason: "code_not_in_pricebook" });
       continue;
     }
 
     const qtyNum = Number(li?.qty ?? pb.min_qty ?? 1);
-    const qty = Number.isFinite(qtyNum) && qtyNum > 0 ? qtyNum : Number(pb.min_qty || 1);
+    const qty =
+      Number.isFinite(qtyNum) && qtyNum > 0
+        ? qtyNum
+        : Number(pb.min_qty || 1);
 
     const unitPrice = Number(pb.unit_price);
     const total = round2(qty * unitPrice);
 
-    if (Number(li?.unit_price) && Number(li?.unit_price) !== unitPrice) {
-      errors.push(`Overrode unit_price for ${code}: model=${li.unit_price} pricebook=${unitPrice}`);
+    // If the model tried to supply unit_price, flag it
+    const modelUnitPrice = li?.unit_price;
+    if (modelUnitPrice !== undefined && modelUnitPrice !== null) {
+      const mup = Number(modelUnitPrice);
+      if (Number.isFinite(mup) && round2(mup) !== round2(unitPrice)) {
+        errors.push(`Model attempted unit_price for ${code}: model=${mup} pricebook=${unitPrice}`);
+      }
     }
 
     fixed.push({
@@ -268,21 +369,31 @@ function validateAndPrice(mapped, pricebookMap) {
   }
 
   const subtotal = round2(fixed.reduce((s, x) => s + Number(x.total || 0), 0));
-  const tax = round2(Number(mapped?.tax || 0));
-  const total = round2(subtotal + tax);
 
   return {
     corrected: {
       summary: String(mapped?.summary || ""),
       line_items: fixed,
       subtotal,
-      tax,
-      total,
       assumptions: Array.isArray(mapped?.assumptions) ? mapped.assumptions.map(String) : [],
+      unmapped_items: Array.isArray(mapped?.unmapped_items) ? mapped.unmapped_items : [],
     },
     errors,
     unmapped,
   };
+}
+
+function bestAliasMatch(rawText, aliasMap) {
+  // Prefer longest alias contained in rawText
+  const t = normalize(rawText);
+  let best = null;
+  for (const [alias, code] of aliasMap.entries()) {
+    if (!alias) continue;
+    if (t.includes(alias)) {
+      if (!best || alias.length > best.alias.length) best = { alias, code };
+    }
+  }
+  return best;
 }
 
 export default async function handler(req, res) {
@@ -296,6 +407,7 @@ export default async function handler(req, res) {
       MAX_PDF_TEXT_CHARS,
       STALE_MINUTES,
       OPENAI_TIMEOUT_MS,
+      TAX_RATE_DEFAULT,
     },
     steps: [],
   };
@@ -354,28 +466,50 @@ export default async function handler(req, res) {
     }
     combined = clamp(combined, MAX_PDF_TEXT_CHARS);
 
-    // Stage A: extract items (NO pricing)
+    // Mark AI started
     debug.steps.push("mark_ai_started");
     await supabase.from("estimate_jobs").update({ status: "ai_started", ai_started_at: nowIso() }).eq("id", job.id);
 
-    debug.steps.push("ai_stage_a_extract");
     const openai = new OpenAI({ apiKey: openaiKey });
+
+    // Stage A: extract items (NO pricing)
+    debug.steps.push("ai_stage_a_extract");
+    const stageASchema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              raw_text: { type: "string" },
+              qty: { type: ["number", "null"] },
+              notes: { type: ["string", "null"] },
+            },
+            required: ["raw_text", "qty", "notes"],
+          },
+        },
+      },
+      required: ["items"],
+    };
 
     const stageA = await withTimeout(
       openai.responses.create({
         model: "gpt-5-mini",
         input: [
           {
+            role: "system",
+            content:
+              "Extract repair/defect items from the document text. Do NOT price anything. Return ONLY JSON matching the schema.",
+          },
+          {
             role: "user",
-            content: `Extract repair items from the document text. Do NOT price anything.
-Return STRICT JSON:
-{"items":[{"raw_text":string,"qty":number|null,"notes":string|null}]}
-
-DOCUMENT TEXT:
-${combined}`,
+            content: `DOCUMENT TEXT:\n${combined}`,
           },
         ],
-        text: { format: { type: "json_object" } },
+        text: { format: { type: "json_schema", name: "stage_a_extract", schema: stageASchema } },
       }),
       OPENAI_TIMEOUT_MS,
       "OpenAI stage A"
@@ -390,46 +524,68 @@ ${combined}`,
     debug.steps.push("build_shortlist");
     const candidates = new Set();
     for (const it of extractedItems) {
-      const raw = String(it?.raw_text || "").toLowerCase();
-      for (const [alias, code] of config.aliasMap.entries()) {
-        if (raw.includes(alias)) candidates.add(code);
-      }
+      const best = bestAliasMatch(it?.raw_text || "", config.aliasMap);
+      if (best?.code) candidates.add(best.code);
     }
-    const shortlist = config.pricebook.filter((p) => candidates.has(p.code)).slice(0, 500);
+    // Keep shortlist reasonable. If empty, give Stage B a chunk of pricebook.
+    const shortlist = config.pricebook.filter((p) => candidates.has(p.code)).slice(0, 600);
+    const pbForModel = shortlist.length ? shortlist : config.pricebook.slice(0, 600);
 
-    // Stage B: map items to codes (NO pricing)
+    // Stage B: map items to codes (NO pricing, NO tax)
     debug.steps.push("ai_stage_b_map");
-    const rulesText = (config.rules || []).map((r) => `- (${r.rule_key}) ${r.rule_text}`).join("\n");
+    const rulesText = (config.rules || [])
+      .map((r) => `- (${r.rule_key}) ${r.rule_text}`)
+      .join("\n");
+
+    const stageBSchema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        summary: { type: "string" },
+        line_items: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              code: { type: "string" },
+              description: { type: "string" },
+              qty: { type: "number" },
+            },
+            required: ["code", "description", "qty"],
+          },
+        },
+        assumptions: { type: "array", items: { type: "string" } },
+        unmapped_items: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: { raw_text: { type: "string" }, reason: { type: "string" } },
+            required: ["raw_text", "reason"],
+          },
+        },
+      },
+      required: ["summary", "line_items", "assumptions", "unmapped_items"],
+    };
 
     const stageB = await withTimeout(
       openai.responses.create({
         model: "gpt-5-mini",
         input: [
           {
+            role: "system",
+            content:
+              "Map extracted items to PRICEBOOK codes only. Do NOT invent codes. Do NOT include prices or tax. Return ONLY JSON matching schema.",
+          },
+          {
             role: "user",
-            content: `You must ONLY use codes from the PRICEBOOK list provided. Do not invent codes or prices.
-If an item cannot be mapped, put it under "unmapped_items" with a reason.
-
-RULES:
-${rulesText || "(none)"}
-
-PRICEBOOK:
-${JSON.stringify(shortlist.length ? shortlist : config.pricebook.slice(0, 500))}
-
-EXTRACTED ITEMS:
-${JSON.stringify(extractedItems)}
-
-Return STRICT JSON:
-{
-  "summary": string,
-  "line_items": [{"code": string, "description": string, "qty": number}],
-  "tax": number,
-  "assumptions": [string],
-  "unmapped_items": [{"raw_text": string, "reason": string}]
-}`,
+            content: `RULES:\n${rulesText || "(none)"}\n\nPRICEBOOK (allowed codes):\n${JSON.stringify(
+              pbForModel
+            )}\n\nEXTRACTED ITEMS:\n${JSON.stringify(extractedItems)}`,
           },
         ],
-        text: { format: { type: "json_object" } },
+        text: { format: { type: "json_schema", name: "stage_b_map", schema: stageBSchema } },
       }),
       OPENAI_TIMEOUT_MS,
       "OpenAI stage B"
@@ -443,27 +599,39 @@ Return STRICT JSON:
     debug.steps.push("validate_and_price");
     const { corrected, errors, unmapped } = validateAndPrice(mapped, config.pricebookMap);
 
-    // Apply trip fee (requires TRIP_FEE exists in pricebook)
+    // Compute trip fee (requires TRIP_FEE exists in pricebook)
     debug.steps.push("apply_trip_fee");
+    let tripFeeAmount = 0;
     if (config.tripFees?.length) {
       const tf = config.tripFees[0]; // simplest: first active row
       const pbTrip = config.pricebookMap.get("TRIP_FEE");
       if (pbTrip) {
-        const fee = round2(Number(tf.base_fee || 0));
+        tripFeeAmount = round2(Number(tf.base_fee || 0));
         corrected.line_items.push({
           code: "TRIP_FEE",
           name: pbTrip.name,
           description: `Trip Fee - ${tf.label}`,
           qty: 1,
-          unit_price: fee,
-          total: fee,
+          unit_price: tripFeeAmount,
+          total: tripFeeAmount,
         });
-        corrected.subtotal = round2(corrected.subtotal + fee);
-        corrected.total = round2(corrected.subtotal + corrected.tax);
+        corrected.subtotal = round2(corrected.subtotal + tripFeeAmount);
       } else {
         errors.push("Trip fee skipped: pricebook code TRIP_FEE not found.");
       }
     }
+
+    // Compute tax + total in code (not from model)
+    debug.steps.push("compute_tax_total");
+    const taxRate = getTaxRateFromRules(config.rules);
+    const tax = round2(corrected.subtotal * taxRate);
+    const total = round2(corrected.subtotal + tax);
+
+    corrected.tax_rate = taxRate;
+    corrected.tax = tax;
+    corrected.total = total;
+    corrected.trip_fee = tripFeeAmount;
+    corrected.estimate_id = job.id;
 
     // Save + complete
     debug.steps.push("save_estimate_complete");
@@ -483,13 +651,33 @@ Return STRICT JSON:
 
     console.log("AI_DONE", job.id);
 
+    // Pick template
+    debug.steps.push("select_template");
+    const templateKey = TEMPLATE_KEY_DEFAULT;
+    const tmpl = (config.templates || []).find((t) => t.template_key === templateKey);
+
+    debug.template_key = templateKey;
+    debug.template_found = Boolean(tmpl);
+
     // Email (customer + internal copy)
     debug.steps.push("send_email");
     sgMail.setApiKey(sendgridKey);
 
     const toList = [job.email, INTERNAL_COPY_EMAIL].filter(Boolean);
-    const subject = `BINSR Pros Estimate - Job ${job.id}`;
-    const html = buildEmailHtml(job, corrected);
+
+    let subject;
+    let html;
+
+    if (tmpl?.body_html) {
+      const built = buildEmailFromTemplate(job, corrected, tmpl);
+      subject = built.subject;
+      html = built.html;
+    } else {
+      // Fallback so you still get output
+      subject = `BINSR Pros Estimate - Job ${job.id}`;
+      html = buildFallbackEmailHtml(job, corrected);
+      errors.push(`Template not found or missing body_html for template_key=${templateKey}. Used fallback.`);
+    }
 
     try {
       await sgMail.send({ to: toList, from: emailFrom, subject, html });
@@ -504,7 +692,12 @@ Return STRICT JSON:
       return res.status(200).json({ ok: true, jobId: job.id, emailed: false, email_error: msg, debug });
     }
 
-    return res.status(200).json({ ok: true, jobId: job.id, emailed: toList, debug });
+    return res.status(200).json({
+      ok: true,
+      jobId: job.id,
+      emailed: toList,
+      debug,
+    });
   } catch (e) {
     console.error("process-job error:", e);
 
