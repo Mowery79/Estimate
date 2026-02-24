@@ -1,13 +1,14 @@
 // pages/api/process-job.js
 //
-// UPDATED DEBUGGABLE WORKER (FIXED)
-// - Normalizes status casing/spacing issues
-// - Optionally skips INSPECTION to avoid OpenAI timeouts
-// - Writes email_error on SendGrid failures
-// - Reclaims stale processing/ai_started jobs
-// - Returns detailed debug JSON on errors
+// PRICEBOOK-ENFORCED WORKER (NEWEST)
+// - Uses Supabase as source of truth for PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES
+// - 2-stage AI: extract items -> map to codes (NO pricing)
+// - Pricing enforced in code from pricebook_items (model cannot invent pricing)
+// - Trip fee applied from trip_fees (requires pricebook code TRIP_FEE)
+// - Emails estimate to customer + BINSR@dignhomes.com (SendGrid)
+// - Debuggable response with steps + stack on failure
 //
-// REQUIRED Vercel env vars (Production + Preview if you use preview URLs):
+// REQUIRED Vercel env vars:
 //   SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
 //   OPENAI_API_KEY
@@ -15,8 +16,8 @@
 //   EMAIL_FROM
 //
 // OPTIONAL env vars:
-//   INCLUDE_INSPECTION        (default "false")  -> set to "true" to include inspection PDF
-//   MAX_PROMPT_CHARS          (default 40000)
+//   INCLUDE_INSPECTION        (default "false")  -> include inspection report PDF
+//   MAX_PDF_TEXT_CHARS        (default 35000)    -> limits PDF text fed to AI
 //   STALE_MINUTES             (default 20)
 //   OPENAI_TIMEOUT_MS         (default 120000)
 //
@@ -31,22 +32,19 @@ import pdf from "pdf-parse";
 import sgMail from "@sendgrid/mail";
 
 const INTERNAL_COPY_EMAIL = "BINSR@dignhomes.com";
-
 const FETCH_TIMEOUT_MS = 30000;
 
 const INCLUDE_INSPECTION = String(process.env.INCLUDE_INSPECTION || "false").toLowerCase() === "true";
-const MAX_PROMPT_CHARS = Number(process.env.MAX_PROMPT_CHARS || 40000);
+const MAX_PDF_TEXT_CHARS = Number(process.env.MAX_PDF_TEXT_CHARS || 35000);
 const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
 
 function nowIso() {
   return new Date().toISOString();
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -56,19 +54,31 @@ async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
     clearTimeout(t);
   }
 }
-
-function clampText(text, maxChars = MAX_PROMPT_CHARS) {
+function clamp(text, maxChars) {
   if (!text) return "";
-  if (text.length <= maxChars) return text;
-  return text.slice(0, maxChars) + "\n\n[TRUNCATED]";
+  return text.length <= maxChars ? text : text.slice(0, maxChars) + "\n\n[TRUNCATED]";
 }
-
 async function pdfTextFromUrl(url) {
   const r = await fetchWithTimeout(url);
   if (!r.ok) throw new Error(`Failed to fetch PDF (${r.status}) from ${url}`);
   const buf = Buffer.from(await r.arrayBuffer());
   const parsed = await pdf(buf);
   return parsed?.text || "";
+}
+async function withTimeout(promise, ms, label = "operation") {
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
 
 function escapeHtml(str) {
@@ -79,7 +89,6 @@ function escapeHtml(str) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
-
 function money(n) {
   const x = Number(n);
   if (!Number.isFinite(x)) return "";
@@ -91,7 +100,7 @@ function buildEmailHtml(job, estimate) {
   const rows = items
     .slice(0, 60)
     .map((li) => {
-      const name = li?.name ?? "";
+      const name = li?.name ?? li?.code ?? "";
       const qty = li?.qty ?? "";
       const unit = money(li?.unit_price);
       const total = money(li?.total);
@@ -110,14 +119,6 @@ function buildEmailHtml(job, estimate) {
       `;
     })
     .join("");
-
-  const assumptions = Array.isArray(estimate?.assumptions) ? estimate.assumptions : [];
-  const assumptionsHtml = assumptions.length
-    ? `<ul style="margin:6px 0 0 18px;">${assumptions
-        .slice(0, 20)
-        .map((a) => `<li>${escapeHtml(String(a))}</li>`)
-        .join("")}</ul>`
-    : `<div style="color:#555;">None listed.</div>`;
 
   return `
   <div style="font-family:Arial,sans-serif;line-height:1.4;color:#111;">
@@ -148,38 +149,21 @@ function buildEmailHtml(job, estimate) {
       <div style="font-size:18px;margin-top:6px;">Total: <strong>${escapeHtml(money(estimate?.total))}</strong></div>
     </div>
 
-    <h3 style="margin:18px 0 6px;">Assumptions</h3>
-    ${assumptionsHtml}
-
     <hr style="border:none;border-top:1px solid #eee;margin:18px 0;" />
     <div style="color:#555;font-size:12px;">
-      This estimate is based on the provided inspection documents and may require confirmation on site.
-      Reply to this email with any questions.
+      This estimate uses BINSR Pros pricebook and rules.
     </div>
   </div>
   `;
 }
 
-async function withTimeout(promise, ms, label = "operation") {
-  let t;
-  const timeout = new Promise((_, reject) => {
-    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// Status variants seen in the wild (case/spacing)
+// Status variants (case/spacing issues)
 const QUEUED_VARIANTS = ["queued", "Queued", "QUEUED"];
 const PROCESSING_VARIANTS = ["processing", "Processing", "PROCESSING"];
 const AI_STARTED_VARIANTS = ["ai_started", "AI_STARTED", "Ai_Started", "ai-started", "AI-STARTED"];
-const FAILED_VARIANTS = ["failed", "Failed", "FAILED"];
 
 async function claimJob(supabase) {
-  // 1) queued first (case variants)
+  // queued first
   const { data: queued, error: qErr } = await supabase
     .from("estimate_jobs")
     .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at,ai_started_at,created_at")
@@ -190,7 +174,7 @@ async function claimJob(supabase) {
   if (qErr) throw new Error(`DB pick queued failed: ${qErr.message}`);
   if (queued?.length) return queued[0];
 
-  // 2) reclaim stale processing/ai_started
+  // reclaim stale processing / ai_started
   const staleCutoff = new Date(Date.now() - STALE_MINUTES * 60 * 1000).toISOString();
   const { data: stale, error: sErr } = await supabase
     .from("estimate_jobs")
@@ -206,14 +190,110 @@ async function claimJob(supabase) {
   return null;
 }
 
+async function loadActiveConfig(supabase) {
+  const { data: cfg, error: cfgErr } = await supabase
+    .from("config_versions")
+    .select("id,label")
+    .eq("active", true)
+    .limit(1)
+    .maybeSingle();
+
+  if (cfgErr || !cfg) throw new Error("No active config_versions row found.");
+
+  const [
+    pbRes,
+    aliasRes,
+    tripRes,
+    rulesRes,
+    tmplRes,
+  ] = await Promise.all([
+    supabase.from("pricebook_items").select("code,name,unit,unit_price,min_qty,notes").eq("active", true),
+    supabase.from("aliases").select("alias,code").eq("active", true),
+    supabase.from("trip_fees").select("label,base_fee,per_mile,after_hours_fee").eq("active", true),
+    supabase.from("estimate_rules").select("rule_key,rule_text,priority").eq("active", true).order("priority", { ascending: true }),
+    supabase.from("templates").select("template_key,subject,body_html").eq("active", true),
+  ]);
+
+  if (pbRes.error) throw new Error(`pricebook_items load failed: ${pbRes.error.message}`);
+  if (aliasRes.error) throw new Error(`aliases load failed: ${aliasRes.error.message}`);
+  if (tripRes.error) throw new Error(`trip_fees load failed: ${tripRes.error.message}`);
+  if (rulesRes.error) throw new Error(`estimate_rules load failed: ${rulesRes.error.message}`);
+  if (tmplRes.error) throw new Error(`templates load failed: ${tmplRes.error.message}`);
+
+  const pricebook = pbRes.data || [];
+  const aliases = aliasRes.data || [];
+  const tripFees = tripRes.data || [];
+  const rules = rulesRes.data || [];
+  const templates = tmplRes.data || [];
+
+  const pricebookMap = new Map(pricebook.map((p) => [p.code, p]));
+  const aliasMap = new Map(aliases.map((a) => [String(a.alias).toLowerCase(), a.code]));
+
+  return { cfg, pricebook, pricebookMap, aliasMap, tripFees, rules, templates };
+}
+
+function validateAndPrice(mapped, pricebookMap) {
+  const errors = [];
+  const unmapped = [];
+
+  const lineItems = Array.isArray(mapped?.line_items) ? mapped.line_items : [];
+  const fixed = [];
+
+  for (const li of lineItems) {
+    const code = String(li?.code || "").trim();
+    const pb = pricebookMap.get(code);
+    if (!pb) {
+      unmapped.push(li);
+      continue;
+    }
+
+    const qtyNum = Number(li?.qty ?? pb.min_qty ?? 1);
+    const qty = Number.isFinite(qtyNum) && qtyNum > 0 ? qtyNum : Number(pb.min_qty || 1);
+
+    const unitPrice = Number(pb.unit_price);
+    const total = round2(qty * unitPrice);
+
+    if (Number(li?.unit_price) && Number(li?.unit_price) !== unitPrice) {
+      errors.push(`Overrode unit_price for ${code}: model=${li.unit_price} pricebook=${unitPrice}`);
+    }
+
+    fixed.push({
+      code: pb.code,
+      name: pb.name,
+      description: String(li?.description || ""),
+      qty,
+      unit_price: unitPrice,
+      total,
+    });
+  }
+
+  const subtotal = round2(fixed.reduce((s, x) => s + Number(x.total || 0), 0));
+  const tax = round2(Number(mapped?.tax || 0));
+  const total = round2(subtotal + tax);
+
+  return {
+    corrected: {
+      summary: String(mapped?.summary || ""),
+      line_items: fixed,
+      subtotal,
+      tax,
+      total,
+      assumptions: Array.isArray(mapped?.assumptions) ? mapped.assumptions.map(String) : [],
+    },
+    errors,
+    unmapped,
+  };
+}
+
 export default async function handler(req, res) {
   let currentJobId = null;
+
   const debug = {
     env: {
       VERCEL_ENV: process.env.VERCEL_ENV,
       VERCEL_URL: process.env.VERCEL_URL,
       INCLUDE_INSPECTION,
-      MAX_PROMPT_CHARS,
+      MAX_PDF_TEXT_CHARS,
       STALE_MINUTES,
       OPENAI_TIMEOUT_MS,
     },
@@ -227,17 +307,14 @@ export default async function handler(req, res) {
     const sendgridKey = process.env.SENDGRID_API_KEY;
     const emailFrom = process.env.EMAIL_FROM;
 
-    debug.env.hasSUPABASE_URL = !!supabaseUrl;
-    debug.env.hasSUPABASE_SERVICE_ROLE_KEY = !!supabaseKey;
-    debug.env.hasOPENAI_API_KEY = !!openaiKey;
-    debug.env.hasSENDGRID_API_KEY = !!sendgridKey;
-    debug.env.hasEMAIL_FROM = !!emailFrom;
-
     if (!supabaseUrl || !supabaseKey || !openaiKey || !sendgridKey || !emailFrom) {
       return res.status(500).json({ ok: false, error: "Missing env vars", debug });
     }
 
     const supabase = createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } });
+
+    debug.steps.push("load_config");
+    const config = await loadActiveConfig(supabase);
 
     debug.steps.push("claim_job");
     const job = await claimJob(supabase);
@@ -245,8 +322,8 @@ export default async function handler(req, res) {
 
     currentJobId = job.id;
     debug.jobId = job.id;
+    debug.configVersion = config.cfg;
 
-    // Claim + mark processing (always write lowercase)
     debug.steps.push("mark_processing");
     await supabase
       .from("estimate_jobs")
@@ -255,100 +332,140 @@ export default async function handler(req, res) {
         started_at: nowIso(),
         error: null,
         email_error: null,
+        config_version_id: config.cfg.id,
       })
       .eq("id", job.id);
 
     console.log("PROCESS_JOB_START", job.id);
 
-    // Build sources
+    // PDFs to use
     debug.steps.push("fetch_parse_pdfs");
     const sources = [];
     if (job.binsr_url) sources.push({ label: "BINSR", url: job.binsr_url });
-
-    // Toggle inspection by env var; default false to reduce timeouts
-    if (INCLUDE_INSPECTION && job.inspection_url) {
-      sources.push({ label: "INSPECTION", url: job.inspection_url });
-    }
-
+    if (INCLUDE_INSPECTION && job.inspection_url) sources.push({ label: "INSPECTION", url: job.inspection_url });
     if (!sources.length) throw new Error("Job has no PDF URLs (binsr_url/inspection_url)");
 
     let combined = "";
     for (const s of sources) {
       console.log("FETCH_PDF", job.id, s.label);
       const txt = await pdfTextFromUrl(s.url);
-      combined += `\n\n===== ${s.label} TEXT START =====\n${txt}\n===== ${s.label} TEXT END =====\n`;
+      combined += `\n\n===== ${s.label} =====\n${txt}\n`;
       await sleep(25);
     }
-    combined = clampText(combined);
+    combined = clamp(combined, MAX_PDF_TEXT_CHARS);
 
-    // AI start
+    // Stage A: extract items (NO pricing)
     debug.steps.push("mark_ai_started");
-    await supabase
-      .from("estimate_jobs")
-      .update({
-        status: "ai_started",
-        ai_started_at: nowIso(),
-      })
-      .eq("id", job.id);
+    await supabase.from("estimate_jobs").update({ status: "ai_started", ai_started_at: nowIso() }).eq("id", job.id);
 
-    console.log("AI_START", job.id);
-
-    debug.steps.push("openai_call");
+    debug.steps.push("ai_stage_a_extract");
     const openai = new OpenAI({ apiKey: openaiKey });
 
-    const prompt = `
-You are BINSR Pros' repair estimator.
-Create a detailed estimate based on the inspection documents below.
-
-Customer:
-- Name: ${job.name || ""}
-- Email: ${job.email || ""}
-- Phone: ${job.phone || ""}
-- Notes: ${job.notes || ""}
-
-DOCUMENT TEXT:
-${combined}
-
-Return STRICT JSON with this structure:
-{
-  "summary": string,
-  "line_items": [
-    {
-      "code": string|null,
-      "name": string,
-      "description": string,
-      "qty": number,
-      "unit_price": number,
-      "total": number
-    }
-  ],
-  "subtotal": number,
-  "tax": number,
-  "total": number,
-  "assumptions": [string]
-}
-`;
-
-    const resp = await withTimeout(
+    const stageA = await withTimeout(
       openai.responses.create({
         model: "gpt-5-mini",
-        input: prompt,
+        input: [
+          {
+            role: "user",
+            content: `Extract repair items from the document text. Do NOT price anything.
+Return STRICT JSON:
+{"items":[{"raw_text":string,"qty":number|null,"notes":string|null}]}
+
+DOCUMENT TEXT:
+${combined}`,
+          },
+        ],
         text: { format: { type: "json_object" } },
       }),
       OPENAI_TIMEOUT_MS,
-      "OpenAI call"
+      "OpenAI stage A"
     );
 
-    const textOut = resp.output_text;
-    if (!textOut) throw new Error("OpenAI response missing output_text");
+    const stageAText = stageA.output_text;
+    if (!stageAText) throw new Error("Stage A missing output_text");
+    const extracted = JSON.parse(stageAText);
+    const extractedItems = Array.isArray(extracted?.items) ? extracted.items : [];
 
-    let estimateJson;
-    try {
-      estimateJson = JSON.parse(textOut);
-    } catch {
-      throw new Error("Failed to parse OpenAI JSON output");
+    // Build shortlist of codes from aliases (keeps Stage B fast)
+    debug.steps.push("build_shortlist");
+    const candidates = new Set();
+    for (const it of extractedItems) {
+      const raw = String(it?.raw_text || "").toLowerCase();
+      for (const [alias, code] of config.aliasMap.entries()) {
+        if (raw.includes(alias)) candidates.add(code);
+      }
+    }
+    const shortlist = config.pricebook.filter((p) => candidates.has(p.code)).slice(0, 150);
+
+    // Stage B: map items to codes (NO pricing)
+    debug.steps.push("ai_stage_b_map");
+    const rulesText = (config.rules || []).map((r) => `- (${r.rule_key}) ${r.rule_text}`).join("\n");
+
+    const stageB = await withTimeout(
+      openai.responses.create({
+        model: "gpt-5-mini",
+        input: [
+          {
+            role: "user",
+            content: `You must ONLY use codes from the PRICEBOOK list provided. Do not invent codes or prices.
+If an item cannot be mapped, put it under "unmapped_items" with a reason.
+
+RULES:
+${rulesText || "(none)"}
+
+PRICEBOOK:
+${JSON.stringify(shortlist.length ? shortlist : config.pricebook.slice(0, 150))}
+
+EXTRACTED ITEMS:
+${JSON.stringify(extractedItems)}
+
+Return STRICT JSON:
+{
+  "summary": string,
+  "line_items": [{"code": string, "description": string, "qty": number}],
+  "tax": number,
+  "assumptions": [string],
+  "unmapped_items": [{"raw_text": string, "reason": string}]
+}`,
+          },
+        ],
+        text: { format: { type: "json_object" } },
+      }),
+      OPENAI_TIMEOUT_MS,
+      "OpenAI stage B"
+    );
+
+    const stageBText = stageB.output_text;
+    if (!stageBText) throw new Error("Stage B missing output_text");
+    const mapped = JSON.parse(stageBText);
+
+    // Enforce pricing from pricebook
+    debug.steps.push("validate_and_price");
+    const { corrected, errors, unmapped } = validateAndPrice(mapped, config.pricebookMap);
+
+    // Apply trip fee (requires TRIP_FEE exists in pricebook)
+    debug.steps.push("apply_trip_fee");
+    if (config.tripFees?.length) {
+      const tf = config.tripFees[0]; // simplest: first active row
+      const pbTrip = config.pricebookMap.get("TRIP_FEE");
+      if (pbTrip) {
+        const fee = round2(Number(tf.base_fee || 0));
+        corrected.line_items.push({
+          code: "TRIP_FEE",
+          name: pbTrip.name,
+          description: `Trip Fee - ${tf.label}`,
+          qty: 1,
+          unit_price: fee,
+          total: fee,
+        });
+        corrected.subtotal = round2(corrected.subtotal + fee);
+        corrected.total = round2(corrected.subtotal + corrected.tax);
+      } else {
+        errors.push("Trip fee skipped: pricebook code TRIP_FEE not found.");
+      }
     }
 
+    // Save + complete
     debug.steps.push("save_estimate_complete");
     await supabase
       .from("estimate_jobs")
@@ -356,83 +473,50 @@ Return STRICT JSON with this structure:
         status: "complete",
         ai_completed_at: nowIso(),
         completed_at: nowIso(),
-        estimate_json: estimateJson,
-        estimate_text: JSON.stringify(estimateJson, null, 2),
+        estimate_json: corrected,
+        estimate_text: JSON.stringify(corrected, null, 2),
+        validation_errors: errors.length ? errors.join("\n") : null,
+        unmapped_items: unmapped?.length ? unmapped : null,
         error: null,
       })
       .eq("id", job.id);
 
     console.log("AI_DONE", job.id);
 
-    // Email
+    // Email (customer + internal copy)
     debug.steps.push("send_email");
     sgMail.setApiKey(sendgridKey);
 
     const toList = [job.email, INTERNAL_COPY_EMAIL].filter(Boolean);
     const subject = `BINSR Pros Estimate - Job ${job.id}`;
-    const html = buildEmailHtml(job, estimateJson);
+    const html = buildEmailHtml(job, corrected);
 
     try {
-      await sgMail.send({
-        to: toList,
-        from: emailFrom,
-        subject,
-        html,
-      });
+      await sgMail.send({ to: toList, from: emailFrom, subject, html });
 
       debug.steps.push("mark_email_sent");
-      await supabase
-        .from("estimate_jobs")
-        .update({
-          email_sent_at: nowIso(),
-          email_error: null,
-        })
-        .eq("id", job.id);
-
+      await supabase.from("estimate_jobs").update({ email_sent_at: nowIso(), email_error: null }).eq("id", job.id);
       console.log("EMAIL_SENT", job.id, toList);
     } catch (mailErr) {
-      // Keep estimate complete, but record email error
       const msg = String(mailErr?.message || mailErr);
-      await supabase
-        .from("estimate_jobs")
-        .update({
-          email_error: msg,
-        })
-        .eq("id", job.id);
-
+      await supabase.from("estimate_jobs").update({ email_error: msg }).eq("id", job.id);
       console.error("EMAIL_FAILED", job.id, msg);
-
-      // Still return 200 since estimate is done (email can be retried)
-      return res.status(200).json({
-        ok: true,
-        jobId: job.id,
-        emailed: false,
-        email_error: msg,
-        debug,
-      });
+      return res.status(200).json({ ok: true, jobId: job.id, emailed: false, email_error: msg, debug });
     }
 
     return res.status(200).json({ ok: true, jobId: job.id, emailed: toList, debug });
   } catch (e) {
     console.error("process-job error:", e);
 
-    // best effort: mark failed using lowercase "failed"
+    // Mark failed
     try {
       if (currentJobId) {
         const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
           auth: { persistSession: false },
         });
-        await supabase
-          .from("estimate_jobs")
-          .update({
-            status: "failed",
-            error: String(e?.message || e),
-          })
-          .eq("id", currentJobId);
+        await supabase.from("estimate_jobs").update({ status: "failed", error: String(e?.message || e) }).eq("id", currentJobId);
       }
-    } catch (inner) {
-      console.error("Failed to mark job failed:", inner);
-    }
+    } catch {}
 
     return res.status(500).json({
       ok: false,
