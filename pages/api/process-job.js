@@ -1,12 +1,16 @@
 // pages/api/process-job.js
 //
-// PRICEBOOK + TEMPLATE ENFORCED WORKER (CORRECTED)
-// - Supabase is source of truth for: PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES
+// PRICEBOOK + TEMPLATE-BLOCK ENFORCED WORKER (UPDATED)
+// - Supabase is source of truth for: PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES, TEMPLATE_BLOCKS
 // - 2-stage AI: extract items -> map to codes (NO pricing, NO tax)
 // - Pricing enforced in code from pricebook_items (model cannot invent pricing)
 // - Trip fee applied from trip_fees (requires pricebook code TRIP_FEE)
-// - Tax computed in code from rule TAX_RATE (fallback 0.112)
-// - Email HTML rendered from templates.body_html (placeholders replaced)
+// - Tax computed in code from template block TAX_RATE (fallback env TAX_RATE_DEFAULT)
+// - Email HTML rendered from templates.body_html + block placeholders:
+//     {HEADER_TITLE},{HEADER_SUBTITLE},{INTRO_TITLE},{INTRO_BODY},{WARRANTY_TITLE},{WARRANTY_BODY},
+//     {PAYMENT_TITLE},{PAYMENT_BODY},{TRIP_FEE_RULE},{TAX_RATE},{TOTAL_LABEL}
+//   Runtime placeholders:
+//     {JobID},{Summary},{LineItemsTable},{Subtotal},{TripFee},{Tax},{Total}
 // - Debuggable response with steps + stack on failure
 //
 // REQUIRED Vercel env vars:
@@ -21,7 +25,8 @@
 //   MAX_PDF_TEXT_CHARS        (default 35000)    -> limits PDF text fed to AI
 //   STALE_MINUTES             (default 20)
 //   OPENAI_TIMEOUT_MS         (default 120000)
-//   TAX_RATE_DEFAULT          (default 0.112)    -> fallback if no DB rule
+//   TAX_RATE_DEFAULT          (default 0.112)
+//   TEMPLATE_KEY_DEFAULT      (default "BINSR_PROS_REPAIR_ESTIMATE_V1")
 //
 // Dependencies:
 //   npm i pdf-parse openai @supabase/supabase-js @sendgrid/mail
@@ -42,8 +47,8 @@ const MAX_PDF_TEXT_CHARS = Number(process.env.MAX_PDF_TEXT_CHARS || 35000);
 const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
 const TAX_RATE_DEFAULT = Number(process.env.TAX_RATE_DEFAULT || 0.112);
-
-const TEMPLATE_KEY_DEFAULT = "BINSR_PROS_REPAIR_ESTIMATE_V1";
+const TEMPLATE_KEY_DEFAULT =
+  String(process.env.TEMPLATE_KEY_DEFAULT || "BINSR_PROS_REPAIR_ESTIMATE_V1");
 
 function nowIso() {
   return new Date().toISOString();
@@ -51,7 +56,6 @@ function nowIso() {
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -61,12 +65,10 @@ async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
     clearTimeout(t);
   }
 }
-
 function clamp(text, maxChars) {
   if (!text) return "";
   return text.length <= maxChars ? text : text.slice(0, maxChars) + "\n\n[TRUNCATED]";
 }
-
 async function pdfTextFromUrl(url) {
   const r = await fetchWithTimeout(url);
   if (!r.ok) throw new Error(`Failed to fetch PDF (${r.status}) from ${url}`);
@@ -74,7 +76,6 @@ async function pdfTextFromUrl(url) {
   const parsed = await pdf(buf);
   return parsed?.text || "";
 }
-
 async function withTimeout(promise, ms, label = "operation") {
   let t;
   const timeout = new Promise((_, reject) => {
@@ -86,11 +87,9 @@ async function withTimeout(promise, ms, label = "operation") {
     clearTimeout(t);
   }
 }
-
 function round2(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
-
 function escapeHtml(str) {
   return String(str ?? "")
     .replaceAll("&", "&amp;")
@@ -99,13 +98,11 @@ function escapeHtml(str) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
-
 function money(n) {
   const x = Number(n);
   if (!Number.isFinite(x)) return "";
   return x.toLocaleString(undefined, { style: "currency", currency: "USD" });
 }
-
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
@@ -162,79 +159,64 @@ function buildLineItemsTableHtml(items) {
   `;
 }
 
-function applyPlaceholders(templateHtml, ctx) {
-  // Keep placeholders simple and explicit.
-  // If you want more later, add here.
+// Turn template_blocks rows into a placeholder map for a template_key
+function blocksToMap(templateBlocks, templateKey) {
+  const m = new Map();
+
+  const blocks = (templateBlocks || [])
+    .filter((b) => String(b.template_key || "").trim() === templateKey)
+    .filter((b) => String(b.active || "Y").trim().toUpperCase() !== "N")
+    .sort((a, b) => Number(a.block_order || 0) - Number(b.block_order || 0));
+
+  for (const b of blocks) {
+    const key = String(b.block_key || "").trim();
+    if (!key) continue;
+
+    // block_value is stored as string/number in DB
+    let val = b.block_value;
+
+    // Normalize by type
+    const t = String(b.block_type || "text").toLowerCase();
+    if (t === "number") {
+      // Keep as string so it pastes cleanly into HTML
+      val = String(val);
+    } else if (t === "lookup") {
+      // Typically "tblTripFees" per your Excel; keep as string label
+      val = String(val);
+    } else {
+      val = String(val ?? "");
+    }
+
+    m.set(key, val);
+  }
+
+  return m;
+}
+
+// Replace {BLOCK_KEY} placeholders with values from blockMap, then fill runtime placeholders.
+function applyPlaceholders(templateHtml, ctx, blockMap) {
   let html = String(templateHtml ?? "");
 
+  // 1) Fill block placeholders like {HEADER_TITLE}
+  if (blockMap && blockMap.size) {
+    for (const [k, v] of blockMap.entries()) {
+      html = html.replaceAll(`{${k}}`, String(v ?? ""));
+    }
+  }
+
+  // 2) Fill runtime placeholders
   const pairs = [
-    ["{JobID}", ctx.jobId],
-    ["{EstimateID}", ctx.estimateId],
-    ["{PropertyAddress}", ctx.propertyAddress],
-    ["{AgentName}", ctx.agentName],
-    ["{ClientName}", ctx.clientName],
-    ["{Summary}", ctx.summary],
-    ["{LineItemsTable}", ctx.lineItemsTable],
+    ["{JobID}", ctx.jobId ?? ""],
+    ["{Summary}", ctx.summary ?? ""],
+    ["{LineItemsTable}", ctx.lineItemsTable ?? ""],
     ["{Subtotal}", money(ctx.subtotal)],
     ["{TripFee}", money(ctx.tripFee)],
     ["{Tax}", money(ctx.tax)],
     ["{Total}", money(ctx.total)],
-    ["{TaxRate}", ctx.taxRate != null ? `${(ctx.taxRate * 100).toFixed(2)}%` : ""],
   ];
 
-  for (const [k, v] of pairs) {
-    html = html.replaceAll(k, String(v ?? ""));
-  }
-
+  for (const [k, v] of pairs) html = html.replaceAll(k, String(v ?? ""));
   return html;
-}
-
-function buildFallbackEmailHtml(job, estimate) {
-  // Only used if no template exists in DB.
-  const rowsTable = buildLineItemsTableHtml(estimate?.line_items || []);
-  return `
-    <div style="font-family:Arial,sans-serif;line-height:1.4;color:#111;">
-      <h2 style="margin:0 0 8px;">BINSR Pros — Repair Estimate</h2>
-      <div style="color:#555;margin-bottom:14px;">Job ID: ${escapeHtml(job.id)}</div>
-
-      <h3 style="margin:18px 0 6px;">Summary</h3>
-      <div style="white-space:pre-wrap;">${escapeHtml(String(estimate?.summary ?? ""))}</div>
-
-      <h3 style="margin:18px 0 6px;">Line Items</h3>
-      ${rowsTable}
-
-      <div style="margin-top:14px;text-align:right;">
-        <div>Subtotal: <strong>${escapeHtml(money(estimate?.subtotal))}</strong></div>
-        <div>Trip Fee: <strong>${escapeHtml(money(estimate?.trip_fee ?? 0))}</strong></div>
-        <div>Tax: <strong>${escapeHtml(money(estimate?.tax))}</strong></div>
-        <div style="font-size:18px;margin-top:6px;">Total: <strong>${escapeHtml(
-          money(estimate?.total)
-        )}</strong></div>
-      </div>
-    </div>
-  `;
-}
-
-function buildEmailFromTemplate(job, estimate, templateRow) {
-  const ctx = {
-    jobId: job.id,
-    estimateId: estimate?.estimate_id || job.id,
-    propertyAddress: estimate?.property_address || "",
-    agentName: estimate?.agent_name || "",
-    clientName: estimate?.client_name || "",
-    summary: estimate?.summary || "",
-    lineItemsTable: buildLineItemsTableHtml(estimate?.line_items || []),
-    subtotal: estimate?.subtotal ?? 0,
-    tripFee: estimate?.trip_fee ?? 0,
-    tax: estimate?.tax ?? 0,
-    total: estimate?.total ?? 0,
-    taxRate: estimate?.tax_rate ?? null,
-  };
-
-  const subject =
-    String(templateRow?.subject || "").trim() || `BINSR Pros Estimate - Job ${job.id}`;
-  const html = applyPlaceholders(templateRow?.body_html, ctx);
-  return { subject, html };
 }
 
 // Status variants (case/spacing issues)
@@ -280,7 +262,7 @@ async function loadActiveConfig(supabase) {
 
   if (cfgErr || !cfg) throw new Error("No active config_versions row found.");
 
-  const [pbRes, aliasRes, tripRes, rulesRes, tmplRes] = await Promise.all([
+  const [pbRes, aliasRes, tripRes, rulesRes, tmplRes, tmplBlocksRes] = await Promise.all([
     supabase.from("pricebook_items").select("code,name,unit,unit_price,min_qty,notes").eq("active", true),
     supabase.from("aliases").select("alias,code").eq("active", true),
     supabase.from("trip_fees").select("label,base_fee,per_mile,after_hours_fee").eq("active", true),
@@ -290,6 +272,10 @@ async function loadActiveConfig(supabase) {
       .eq("active", true)
       .order("priority", { ascending: true }),
     supabase.from("templates").select("template_key,subject,body_html").eq("active", true),
+    supabase
+      .from("template_blocks")
+      .select("template_key,block_key,block_type,block_order,block_value,active")
+      .eq("active", true),
   ]);
 
   if (pbRes.error) throw new Error(`pricebook_items load failed: ${pbRes.error.message}`);
@@ -297,32 +283,32 @@ async function loadActiveConfig(supabase) {
   if (tripRes.error) throw new Error(`trip_fees load failed: ${tripRes.error.message}`);
   if (rulesRes.error) throw new Error(`estimate_rules load failed: ${rulesRes.error.message}`);
   if (tmplRes.error) throw new Error(`templates load failed: ${tmplRes.error.message}`);
+  if (tmplBlocksRes.error) throw new Error(`template_blocks load failed: ${tmplBlocksRes.error.message}`);
 
   const pricebook = pbRes.data || [];
   const aliases = aliasRes.data || [];
   const tripFees = tripRes.data || [];
   const rules = rulesRes.data || [];
   const templates = tmplRes.data || [];
+  const templateBlocks = tmplBlocksRes.data || [];
 
   const pricebookMap = new Map(pricebook.map((p) => [p.code, p]));
   const aliasMap = new Map(aliases.map((a) => [String(a.alias || "").toLowerCase(), a.code]));
 
-  return { cfg, pricebook, pricebookMap, aliasMap, tripFees, rules, templates };
+  return { cfg, pricebook, pricebookMap, aliasMap, tripFees, rules, templates, templateBlocks };
 }
 
-function getTaxRateFromRules(rules) {
-  // Look for a rule like: rule_key="TAX_RATE" and rule_text="0.112" (or "11.2%")
-  const r = (rules || []).find((x) => String(x.rule_key || "").toUpperCase() === "TAX_RATE");
-  if (!r) return TAX_RATE_DEFAULT;
+function getTaxRateFromTemplateBlocks(blockMap) {
+  // Prefer TAX_RATE block if present (stored as decimal string like "0.112")
+  const raw = blockMap?.get("TAX_RATE");
+  if (raw === undefined || raw === null || raw === "") return TAX_RATE_DEFAULT;
 
-  const t = String(r.rule_text || "").trim();
-  // Try decimal first
-  const n = Number(t.replace("%", ""));
+  const n = Number(String(raw).trim().replace("%", ""));
   if (!Number.isFinite(n)) return TAX_RATE_DEFAULT;
 
-  // If it was "11.2%" interpret as percent
-  if (t.includes("%") || n > 1) return round2(n / 100);
-  return n; // already decimal like 0.112
+  // If "11.2" or "11.2%" interpret as percent; if "0.112" keep as decimal
+  if (String(raw).includes("%") || n > 1) return round2(n / 100);
+  return n;
 }
 
 function validateAndPrice(mapped, pricebookMap) {
@@ -342,9 +328,7 @@ function validateAndPrice(mapped, pricebookMap) {
 
     const qtyNum = Number(li?.qty ?? pb.min_qty ?? 1);
     const qty =
-      Number.isFinite(qtyNum) && qtyNum > 0
-        ? qtyNum
-        : Number(pb.min_qty || 1);
+      Number.isFinite(qtyNum) && qtyNum > 0 ? qtyNum : Number(pb.min_qty || 1);
 
     const unitPrice = Number(pb.unit_price);
     const total = round2(qty * unitPrice);
@@ -408,6 +392,7 @@ export default async function handler(req, res) {
       STALE_MINUTES,
       OPENAI_TIMEOUT_MS,
       TAX_RATE_DEFAULT,
+      TEMPLATE_KEY_DEFAULT,
     },
     steps: [],
   };
@@ -454,7 +439,8 @@ export default async function handler(req, res) {
     debug.steps.push("fetch_parse_pdfs");
     const sources = [];
     if (job.binsr_url) sources.push({ label: "BINSR", url: job.binsr_url });
-    if (INCLUDE_INSPECTION && job.inspection_url) sources.push({ label: "INSPECTION", url: job.inspection_url });
+    if (INCLUDE_INSPECTION && job.inspection_url)
+      sources.push({ label: "INSPECTION", url: job.inspection_url });
     if (!sources.length) throw new Error("Job has no PDF URLs (binsr_url/inspection_url)");
 
     let combined = "";
@@ -468,7 +454,10 @@ export default async function handler(req, res) {
 
     // Mark AI started
     debug.steps.push("mark_ai_started");
-    await supabase.from("estimate_jobs").update({ status: "ai_started", ai_started_at: nowIso() }).eq("id", job.id);
+    await supabase
+      .from("estimate_jobs")
+      .update({ status: "ai_started", ai_started_at: nowIso() })
+      .eq("id", job.id);
 
     const openai = new OpenAI({ apiKey: openaiKey });
 
@@ -527,7 +516,6 @@ export default async function handler(req, res) {
       const best = bestAliasMatch(it?.raw_text || "", config.aliasMap);
       if (best?.code) candidates.add(best.code);
     }
-    // Keep shortlist reasonable. If empty, give Stage B a chunk of pricebook.
     const shortlist = config.pricebook.filter((p) => candidates.has(p.code)).slice(0, 600);
     const pbForModel = shortlist.length ? shortlist : config.pricebook.slice(0, 600);
 
@@ -599,7 +587,7 @@ export default async function handler(req, res) {
     debug.steps.push("validate_and_price");
     const { corrected, errors, unmapped } = validateAndPrice(mapped, config.pricebookMap);
 
-    // Compute trip fee (requires TRIP_FEE exists in pricebook)
+    // Apply trip fee (requires TRIP_FEE exists in pricebook)
     debug.steps.push("apply_trip_fee");
     let tripFeeAmount = 0;
     if (config.tripFees?.length) {
@@ -621,9 +609,19 @@ export default async function handler(req, res) {
       }
     }
 
-    // Compute tax + total in code (not from model)
+    // Select template + blocks
+    debug.steps.push("select_template");
+    const templateKey = TEMPLATE_KEY_DEFAULT;
+    const tmpl = (config.templates || []).find((t) => t.template_key === templateKey);
+    if (!tmpl?.body_html) throw new Error(`Missing templates.body_html for template_key=${templateKey}`);
+
+    const blockMap = blocksToMap(config.templateBlocks, templateKey);
+    debug.template_key = templateKey;
+    debug.template_blocks_count = blockMap.size;
+
+    // Compute tax + total from TAX_RATE block (fallback env)
     debug.steps.push("compute_tax_total");
-    const taxRate = getTaxRateFromRules(config.rules);
+    const taxRate = getTaxRateFromTemplateBlocks(blockMap);
     const tax = round2(corrected.subtotal * taxRate);
     const total = round2(corrected.subtotal + tax);
 
@@ -651,33 +649,28 @@ export default async function handler(req, res) {
 
     console.log("AI_DONE", job.id);
 
-    // Pick template
-    debug.steps.push("select_template");
-    const templateKey = TEMPLATE_KEY_DEFAULT;
-    const tmpl = (config.templates || []).find((t) => t.template_key === templateKey);
+    // Render HTML from template + placeholders
+    debug.steps.push("render_template");
+    const ctx = {
+      jobId: job.id,
+      summary: corrected.summary || "",
+      lineItemsTable: buildLineItemsTableHtml(corrected.line_items || []),
+      subtotal: corrected.subtotal ?? 0,
+      tripFee: corrected.trip_fee ?? 0,
+      tax: corrected.tax ?? 0,
+      total: corrected.total ?? 0,
+    };
 
-    debug.template_key = templateKey;
-    debug.template_found = Boolean(tmpl);
+    // Also provide TRIP_FEE_RULE and TAX_RATE placeholders via blocks
+    // (blocks already fill them when template contains {TRIP_FEE_RULE} and {TAX_RATE})
+    const subject = String(tmpl.subject || `BINSR Pros Estimate - Job ${job.id}`).trim();
+    const html = applyPlaceholders(tmpl.body_html, ctx, blockMap);
 
     // Email (customer + internal copy)
     debug.steps.push("send_email");
     sgMail.setApiKey(sendgridKey);
 
     const toList = [job.email, INTERNAL_COPY_EMAIL].filter(Boolean);
-
-    let subject;
-    let html;
-
-    if (tmpl?.body_html) {
-      const built = buildEmailFromTemplate(job, corrected, tmpl);
-      subject = built.subject;
-      html = built.html;
-    } else {
-      // Fallback so you still get output
-      subject = `BINSR Pros Estimate - Job ${job.id}`;
-      html = buildFallbackEmailHtml(job, corrected);
-      errors.push(`Template not found or missing body_html for template_key=${templateKey}. Used fallback.`);
-    }
 
     try {
       await sgMail.send({ to: toList, from: emailFrom, subject, html });
