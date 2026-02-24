@@ -395,7 +395,7 @@ ${combined}`,
         if (raw.includes(alias)) candidates.add(code);
       }
     }
-    const shortlist = config.pricebook.filter((p) => candidates.has(p.code)).slice(0, 150);
+    const shortlist = config.pricebook.filter((p) => candidates.has(p.code)).slice(0, 500);
 
     // Stage B: map items to codes (NO pricing)
     debug.steps.push("ai_stage_b_map");
