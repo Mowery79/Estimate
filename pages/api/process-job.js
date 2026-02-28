@@ -240,7 +240,7 @@ async function claimJob(supabase) {
   const staleCutoff = new Date(Date.now() - STALE_MINUTES * 60 * 1000).toISOString();
   const { data: stale, error: sErr } = await supabase
     .from("estimate_jobs")
-    .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at,ai_started_at,created_at")
+    .select("id,email,first_name,last_name,phone,notes,binsr_url,inspection_url,close_of_escrow_date,property_address,city,zip,status,started_at,ai_started_at,created_at")
     .in("status", [...PROCESSING_VARIANTS, ...AI_STARTED_VARIANTS])
     .or(`started_at.lt.${staleCutoff},ai_started_at.lt.${staleCutoff}`)
     .order("created_at", { ascending: true })
