@@ -228,7 +228,7 @@ async function claimJob(supabase) {
   // queued first
   const { data: queued, error: qErr } = await supabase
     .from("estimate_jobs")
-    .select("id,email,name,phone,notes,binsr_url,inspection_url,status,started_at,ai_started_at,created_at")
+    .select("id,email,first_name,last_name,phone,notes,binsr_url,inspection_url,close_of_escrow_date,property_address,city,zip,status,started_at,ai_started_at,created_at")
     .in("status", QUEUED_VARIANTS)
     .order("created_at", { ascending: true })
     .limit(1);
