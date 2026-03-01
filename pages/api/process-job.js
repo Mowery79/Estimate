@@ -220,7 +220,7 @@ function applyPlaceholders(templateHtml, ctx, blockMap) {
 }
 
 // Status variants (case/spacing issues)
-const QUEUED_VARIANTS = ["queued", "Queued", "QUEUED"];
+const QUEUED_VARIANTS = ["queued", "Queued", "QUEUED", "estimating", "Estimating", "ESTIMATING"];
 const PROCESSING_VARIANTS = ["processing", "Processing", "PROCESSING"];
 const AI_STARTED_VARIANTS = ["ai_started", "AI_STARTED", "Ai_Started", "ai-started", "AI-STARTED"];
 
