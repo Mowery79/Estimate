@@ -1,6 +1,6 @@
 // pages/api/process-job.js
 //
-// PRICEBOOK + TEMPLATE-BLOCK ENFORCED WORKER (UPDATED + BASE44 SYNC)
+// PRICEBOOK + TEMPLATE-BLOCK ENFORCED WORKER (UPDATED + BASE44 ESTIMATE SYNC)
 //
 // - Supabase is source of truth for: PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES, TEMPLATE_BLOCKS
 // - 2-stage AI: extract items -> map to codes (NO pricing, NO tax)
@@ -13,9 +13,10 @@
 //   Runtime placeholders:
 //     {JobID},{Summary},{LineItemsTable},{Subtotal},{TripFee},{Tax},{Total}
 //
-// NEW: Base44 Estimate Sync (Option 2)
-// - After writing estimate_json + status='complete', calls /api/sync-base44-estimate with { jobId }
-// - Secured by SYNC_SECRET header if provided
+// NEW: Base44 sync (Option 2)
+// - After writing estimate_json + status='complete', calls Base44 function endpoint to create/update Base44 Estimate entity.
+// - Endpoint: BASE44_SYNC_URL (example: https://binsr-pro-flow.base44.app/api/functions/syncEstimateFromSupabase)
+// - Security: header x-webhook-secret = ESTIMATE_SYNC_WEBHOOK_SECRET
 //
 // REQUIRED Vercel env vars:
 //   SUPABASE_URL
@@ -24,6 +25,10 @@
 //   SENDGRID_API_KEY
 //   EMAIL_FROM
 //
+// REQUIRED for Base44 sync:
+//   BASE44_SYNC_URL
+//   ESTIMATE_SYNC_WEBHOOK_SECRET
+//
 // OPTIONAL env vars:
 //   INCLUDE_INSPECTION        (default "false")  -> include inspection report PDF
 //   MAX_PDF_TEXT_CHARS        (default 35000)    -> limits PDF text fed to AI
@@ -31,9 +36,6 @@
 //   OPENAI_TIMEOUT_MS         (default 120000)
 //   TAX_RATE_DEFAULT          (default 0.112)
 //   TEMPLATE_KEY_DEFAULT      (default "BINSR_PROS_REPAIR_ESTIMATE_V1")
-//   SYNC_SECRET               (default "")        -> shared secret for sync endpoint
-//   PUBLIC_BASE_URL           (default "")        -> e.g. https://estimate.yourdomain.com (preferred)
-//   SYNC_ENDPOINT_URL         (default "")        -> full URL override for sync endpoint
 //
 // Dependencies:
 //   npm i pdf-parse openai @supabase/supabase-js @sendgrid/mail
@@ -54,12 +56,13 @@ const MAX_PDF_TEXT_CHARS = Number(process.env.MAX_PDF_TEXT_CHARS || 35000);
 const STALE_MINUTES = Number(process.env.STALE_MINUTES || 20);
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
 const TAX_RATE_DEFAULT = Number(process.env.TAX_RATE_DEFAULT || 0.112);
-const TEMPLATE_KEY_DEFAULT =
-  String(process.env.TEMPLATE_KEY_DEFAULT || "BINSR_PROS_REPAIR_ESTIMATE_V1");
+const TEMPLATE_KEY_DEFAULT = String(
+  process.env.TEMPLATE_KEY_DEFAULT || "BINSR_PROS_REPAIR_ESTIMATE_V1"
+);
 
-const SYNC_SECRET = String(process.env.SYNC_SECRET || "");
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "");
-const SYNC_ENDPOINT_URL = String(process.env.SYNC_ENDPOINT_URL || "");
+// Base44 sync
+const BASE44_SYNC_URL = String(process.env.BASE44_SYNC_URL || "");
+const ESTIMATE_SYNC_WEBHOOK_SECRET = String(process.env.ESTIMATE_SYNC_WEBHOOK_SECRET || "");
 
 function nowIso() {
   return new Date().toISOString();
@@ -132,7 +135,9 @@ function buildLineItemsTableHtml(items) {
             <strong>${escapeHtml(li?.name || li?.code || "")}</strong>
             ${
               li?.description
-                ? `<div style="color:#555;font-size:12px;margin-top:2px;">${escapeHtml(li.description)}</div>`
+                ? `<div style="color:#555;font-size:12px;margin-top:2px;">${escapeHtml(
+                    li.description
+                  )}</div>`
                 : ""
             }
           </td>
@@ -330,8 +335,7 @@ function validateAndPrice(mapped, pricebookMap) {
     }
 
     const qtyNum = Number(li?.qty ?? pb.min_qty ?? 1);
-    const qty =
-      Number.isFinite(qtyNum) && qtyNum > 0 ? qtyNum : Number(pb.min_qty || 1);
+    const qty = Number.isFinite(qtyNum) && qtyNum > 0 ? qtyNum : Number(pb.min_qty || 1);
 
     const unitPrice = Number(pb.unit_price);
     const total = round2(qty * unitPrice);
@@ -381,60 +385,50 @@ function bestAliasMatch(rawText, aliasMap) {
   return best;
 }
 
-function getRequestBaseUrl(req) {
-  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/$/, "");
-  if (SYNC_ENDPOINT_URL) {
-    try {
-      const u = new URL(SYNC_ENDPOINT_URL);
-      return `${u.protocol}//${u.host}`;
-    } catch {
-      // ignore
-    }
+async function syncBase44Estimate(jobId, debug) {
+  // Do not hard-fail the job if sync is not configured
+  if (!BASE44_SYNC_URL) {
+    debug.base44_sync = { attempted: false, reason: "BASE44_SYNC_URL not set" };
+    return;
   }
-  const host = req?.headers?.host;
-  if (host) return `https://${host}`;
-  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-  return "";
-}
-
-async function syncBase44Estimate(req, jobId, debug) {
-  const endpoint = SYNC_ENDPOINT_URL
-    ? SYNC_ENDPOINT_URL
-    : `${getRequestBaseUrl(req)}/api/sync-base44-estimate`;
-
-  if (!endpoint) {
-    debug.base44_sync = { attempted: false, reason: "no_endpoint" };
+  if (!ESTIMATE_SYNC_WEBHOOK_SECRET) {
+    debug.base44_sync = { attempted: false, reason: "ESTIMATE_SYNC_WEBHOOK_SECRET not set" };
     return;
   }
 
-  const headers = { "Content-Type": "application/json" };
-  if (SYNC_SECRET) headers["x-sync-secret"] = SYNC_SECRET;
-
   try {
-    const r = await fetch(endpoint, {
+    const r = await fetch(BASE44_SYNC_URL, {
       method: "POST",
-      headers,
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": ESTIMATE_SYNC_WEBHOOK_SECRET,
+      },
       body: JSON.stringify({ jobId }),
     });
 
     const text = await r.text();
     let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch {}
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {}
 
     debug.base44_sync = {
       attempted: true,
-      endpoint,
+      url: BASE44_SYNC_URL,
       status: r.status,
       ok: r.ok,
       response: data || text?.slice?.(0, 500),
     };
+
+    console.log("BASE44_SYNC", jobId, r.status, (text || "").slice(0, 300));
   } catch (e) {
     debug.base44_sync = {
       attempted: true,
-      endpoint,
+      url: BASE44_SYNC_URL,
       ok: false,
       error: String(e?.message || e),
     };
+    console.error("BASE44_SYNC_FAILED", jobId, e?.message || e);
   }
 }
 
@@ -451,9 +445,8 @@ export default async function handler(req, res) {
       OPENAI_TIMEOUT_MS,
       TAX_RATE_DEFAULT,
       TEMPLATE_KEY_DEFAULT,
-      PUBLIC_BASE_URL,
-      SYNC_ENDPOINT_URL: SYNC_ENDPOINT_URL ? "[set]" : "",
-      SYNC_SECRET: SYNC_SECRET ? "[set]" : "",
+      BASE44_SYNC_URL: BASE44_SYNC_URL ? "[set]" : "",
+      ESTIMATE_SYNC_WEBHOOK_SECRET: ESTIMATE_SYNC_WEBHOOK_SECRET ? "[set]" : "",
     },
     steps: [],
   };
@@ -469,7 +462,9 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, error: "Missing env vars", debug });
     }
 
-    const supabase = createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } });
+    const supabase = createClient(supabaseUrl, supabaseKey, {
+      auth: { persistSession: false },
+    });
 
     debug.steps.push("load_config");
     const config = await loadActiveConfig(supabase);
@@ -554,10 +549,7 @@ export default async function handler(req, res) {
             content:
               "Extract repair/defect items from the document text. Do NOT price anything. Return ONLY JSON matching the schema.",
           },
-          {
-            role: "user",
-            content: `DOCUMENT TEXT:\n${combined}`,
-          },
+          { role: "user", content: `DOCUMENT TEXT:\n${combined}` },
         ],
         text: { format: { type: "json_schema", name: "stage_a_extract", schema: stageASchema } },
       }),
@@ -674,7 +666,8 @@ export default async function handler(req, res) {
     debug.steps.push("select_template");
     const templateKey = TEMPLATE_KEY_DEFAULT;
     const tmpl = (config.templates || []).find((t) => t.template_key === templateKey);
-    if (!tmpl?.body_html) throw new Error(`Missing templates.body_html for template_key=${templateKey}`);
+    if (!tmpl?.body_html)
+      throw new Error(`Missing templates.body_html for template_key=${templateKey}`);
 
     const blockMap = blocksToMap(config.templateBlocks, templateKey);
     debug.template_key = templateKey;
@@ -712,7 +705,7 @@ export default async function handler(req, res) {
 
     // NEW: Sync Base44 Estimate entity (do not fail job if sync fails)
     debug.steps.push("sync_base44_estimate");
-    await syncBase44Estimate(req, job.id, debug);
+    await syncBase44Estimate(job.id, debug);
 
     // Render HTML from template + placeholders
     debug.steps.push("render_template");
@@ -739,7 +732,11 @@ export default async function handler(req, res) {
       await sgMail.send({ to: toList, from: emailFrom, subject, html });
 
       debug.steps.push("mark_email_sent");
-      await supabase.from("estimate_jobs").update({ email_sent_at: nowIso(), email_error: null }).eq("id", job.id);
+      await supabase
+        .from("estimate_jobs")
+        .update({ email_sent_at: nowIso(), email_error: null })
+        .eq("id", job.id);
+
       console.log("EMAIL_SENT", job.id, toList);
     } catch (mailErr) {
       const msg = String(mailErr?.message || mailErr);
@@ -748,12 +745,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, jobId: job.id, emailed: false, email_error: msg, debug });
     }
 
-    return res.status(200).json({
-      ok: true,
-      jobId: job.id,
-      emailed: toList,
-      debug,
-    });
+    return res.status(200).json({ ok: true, jobId: job.id, emailed: toList, debug });
   } catch (e) {
     console.error("process-job error:", e);
 
