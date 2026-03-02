@@ -1,6 +1,7 @@
 // pages/api/process-job.js
 //
-// PRICEBOOK + TEMPLATE-BLOCK ENFORCED WORKER (UPDATED)
+// PRICEBOOK + TEMPLATE-BLOCK ENFORCED WORKER (UPDATED + BASE44 SYNC)
+//
 // - Supabase is source of truth for: PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES, TEMPLATE_BLOCKS
 // - 2-stage AI: extract items -> map to codes (NO pricing, NO tax)
 // - Pricing enforced in code from pricebook_items (model cannot invent pricing)
@@ -11,7 +12,10 @@
 //     {PAYMENT_TITLE},{PAYMENT_BODY},{TRIP_FEE_RULE},{TAX_RATE},{TOTAL_LABEL}
 //   Runtime placeholders:
 //     {JobID},{Summary},{LineItemsTable},{Subtotal},{TripFee},{Tax},{Total}
-// - Debuggable response with steps + stack on failure
+//
+// NEW: Base44 Estimate Sync (Option 2)
+// - After writing estimate_json + status='complete', calls /api/sync-base44-estimate with { jobId }
+// - Secured by SYNC_SECRET header if provided
 //
 // REQUIRED Vercel env vars:
 //   SUPABASE_URL
@@ -27,6 +31,9 @@
 //   OPENAI_TIMEOUT_MS         (default 120000)
 //   TAX_RATE_DEFAULT          (default 0.112)
 //   TEMPLATE_KEY_DEFAULT      (default "BINSR_PROS_REPAIR_ESTIMATE_V1")
+//   SYNC_SECRET               (default "")        -> shared secret for sync endpoint
+//   PUBLIC_BASE_URL           (default "")        -> e.g. https://estimate.yourdomain.com (preferred)
+//   SYNC_ENDPOINT_URL         (default "")        -> full URL override for sync endpoint
 //
 // Dependencies:
 //   npm i pdf-parse openai @supabase/supabase-js @sendgrid/mail
@@ -49,6 +56,10 @@ const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
 const TAX_RATE_DEFAULT = Number(process.env.TAX_RATE_DEFAULT || 0.112);
 const TEMPLATE_KEY_DEFAULT =
   String(process.env.TEMPLATE_KEY_DEFAULT || "BINSR_PROS_REPAIR_ESTIMATE_V1");
+
+const SYNC_SECRET = String(process.env.SYNC_SECRET || "");
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "");
+const SYNC_ENDPOINT_URL = String(process.env.SYNC_ENDPOINT_URL || "");
 
 function nowIso() {
   return new Date().toISOString();
@@ -172,20 +183,11 @@ function blocksToMap(templateBlocks, templateKey) {
     const key = String(b.block_key || "").trim();
     if (!key) continue;
 
-    // block_value is stored as string/number in DB
     let val = b.block_value;
-
-    // Normalize by type
     const t = String(b.block_type || "text").toLowerCase();
-    if (t === "number") {
-      // Keep as string so it pastes cleanly into HTML
-      val = String(val);
-    } else if (t === "lookup") {
-      // Typically "tblTripFees" per your Excel; keep as string label
-      val = String(val);
-    } else {
-      val = String(val ?? "");
-    }
+    if (t === "number") val = String(val);
+    else if (t === "lookup") val = String(val);
+    else val = String(val ?? "");
 
     m.set(key, val);
   }
@@ -225,10 +227,13 @@ const PROCESSING_VARIANTS = ["processing", "Processing", "PROCESSING"];
 const AI_STARTED_VARIANTS = ["ai_started", "AI_STARTED", "Ai_Started", "ai-started", "AI-STARTED"];
 
 async function claimJob(supabase) {
+  const cols =
+    "id,email,first_name,last_name,phone,notes,binsr_url,inspection_url,close_of_escrow_date,property_address,city,zip,base44_job_id,base44_estimate_id,status,started_at,ai_started_at,created_at";
+
   // queued first
   const { data: queued, error: qErr } = await supabase
     .from("estimate_jobs")
-    .select("id,email,first_name,last_name,phone,notes,binsr_url,inspection_url,close_of_escrow_date,property_address,city,zip,status,started_at,ai_started_at,created_at")
+    .select(cols)
     .in("status", QUEUED_VARIANTS)
     .order("created_at", { ascending: true })
     .limit(1);
@@ -240,7 +245,7 @@ async function claimJob(supabase) {
   const staleCutoff = new Date(Date.now() - STALE_MINUTES * 60 * 1000).toISOString();
   const { data: stale, error: sErr } = await supabase
     .from("estimate_jobs")
-    .select("id,email,first_name,last_name,phone,notes,binsr_url,inspection_url,close_of_escrow_date,property_address,city,zip,status,started_at,ai_started_at,created_at")
+    .select(cols)
     .in("status", [...PROCESSING_VARIANTS, ...AI_STARTED_VARIANTS])
     .or(`started_at.lt.${staleCutoff},ai_started_at.lt.${staleCutoff}`)
     .order("created_at", { ascending: true })
@@ -299,14 +304,12 @@ async function loadActiveConfig(supabase) {
 }
 
 function getTaxRateFromTemplateBlocks(blockMap) {
-  // Prefer TAX_RATE block if present (stored as decimal string like "0.112")
   const raw = blockMap?.get("TAX_RATE");
   if (raw === undefined || raw === null || raw === "") return TAX_RATE_DEFAULT;
 
   const n = Number(String(raw).trim().replace("%", ""));
   if (!Number.isFinite(n)) return TAX_RATE_DEFAULT;
 
-  // If "11.2" or "11.2%" interpret as percent; if "0.112" keep as decimal
   if (String(raw).includes("%") || n > 1) return round2(n / 100);
   return n;
 }
@@ -333,7 +336,6 @@ function validateAndPrice(mapped, pricebookMap) {
     const unitPrice = Number(pb.unit_price);
     const total = round2(qty * unitPrice);
 
-    // If the model tried to supply unit_price, flag it
     const modelUnitPrice = li?.unit_price;
     if (modelUnitPrice !== undefined && modelUnitPrice !== null) {
       const mup = Number(modelUnitPrice);
@@ -368,7 +370,6 @@ function validateAndPrice(mapped, pricebookMap) {
 }
 
 function bestAliasMatch(rawText, aliasMap) {
-  // Prefer longest alias contained in rawText
   const t = normalize(rawText);
   let best = null;
   for (const [alias, code] of aliasMap.entries()) {
@@ -378,6 +379,63 @@ function bestAliasMatch(rawText, aliasMap) {
     }
   }
   return best;
+}
+
+function getRequestBaseUrl(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/$/, "");
+  if (SYNC_ENDPOINT_URL) {
+    try {
+      const u = new URL(SYNC_ENDPOINT_URL);
+      return `${u.protocol}//${u.host}`;
+    } catch {
+      // ignore
+    }
+  }
+  const host = req?.headers?.host;
+  if (host) return `https://${host}`;
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return "";
+}
+
+async function syncBase44Estimate(req, jobId, debug) {
+  const endpoint = SYNC_ENDPOINT_URL
+    ? SYNC_ENDPOINT_URL
+    : `${getRequestBaseUrl(req)}/api/sync-base44-estimate`;
+
+  if (!endpoint) {
+    debug.base44_sync = { attempted: false, reason: "no_endpoint" };
+    return;
+  }
+
+  const headers = { "Content-Type": "application/json" };
+  if (SYNC_SECRET) headers["x-sync-secret"] = SYNC_SECRET;
+
+  try {
+    const r = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jobId }),
+    });
+
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch {}
+
+    debug.base44_sync = {
+      attempted: true,
+      endpoint,
+      status: r.status,
+      ok: r.ok,
+      response: data || text?.slice?.(0, 500),
+    };
+  } catch (e) {
+    debug.base44_sync = {
+      attempted: true,
+      endpoint,
+      ok: false,
+      error: String(e?.message || e),
+    };
+  }
 }
 
 export default async function handler(req, res) {
@@ -393,6 +451,9 @@ export default async function handler(req, res) {
       OPENAI_TIMEOUT_MS,
       TAX_RATE_DEFAULT,
       TEMPLATE_KEY_DEFAULT,
+      PUBLIC_BASE_URL,
+      SYNC_ENDPOINT_URL: SYNC_ENDPOINT_URL ? "[set]" : "",
+      SYNC_SECRET: SYNC_SECRET ? "[set]" : "",
     },
     steps: [],
   };
@@ -649,6 +710,10 @@ export default async function handler(req, res) {
 
     console.log("AI_DONE", job.id);
 
+    // NEW: Sync Base44 Estimate entity (do not fail job if sync fails)
+    debug.steps.push("sync_base44_estimate");
+    await syncBase44Estimate(req, job.id, debug);
+
     // Render HTML from template + placeholders
     debug.steps.push("render_template");
     const ctx = {
@@ -661,8 +726,6 @@ export default async function handler(req, res) {
       total: corrected.total ?? 0,
     };
 
-    // Also provide TRIP_FEE_RULE and TAX_RATE placeholders via blocks
-    // (blocks already fill them when template contains {TRIP_FEE_RULE} and {TAX_RATE})
     const subject = String(tmpl.subject || `BINSR Pros Estimate - Job ${job.id}`).trim();
     const html = applyPlaceholders(tmpl.body_html, ctx, blockMap);
 
@@ -700,7 +763,10 @@ export default async function handler(req, res) {
         const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
           auth: { persistSession: false },
         });
-        await supabase.from("estimate_jobs").update({ status: "failed", error: String(e?.message || e) }).eq("id", currentJobId);
+        await supabase
+          .from("estimate_jobs")
+          .update({ status: "failed", error: String(e?.message || e) })
+          .eq("id", currentJobId);
       }
     } catch {}
 
