@@ -1,53 +1,45 @@
 // pages/api/process-job.js
 //
-// PRICEBOOK + TEMPLATE-BLOCK ENFORCED WORKER (UPDATED + BASE44 ESTIMATE SYNC)
+// PRICEBOOK + TEMPLATE-BLOCK ENFORCED WORKER (UPDATED + BASE44 ESTIMATE SYNC, EMAIL DISABLED)
 //
-// - Supabase is source of truth for: PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATES, TEMPLATE_BLOCKS
+// - Supabase is source of truth for: PRICEBOOK, ALIASES, RULES, TRIP FEES, TEMPLATE_BLOCKS
 // - 2-stage AI: extract items -> map to codes (NO pricing, NO tax)
 // - Pricing enforced in code from pricebook_items (model cannot invent pricing)
 // - Trip fee applied from trip_fees (requires pricebook code TRIP_FEE)
 // - Tax computed in code from template block TAX_RATE (fallback env TAX_RATE_DEFAULT)
-// - Email HTML rendered from templates.body_html + block placeholders:
-//     {HEADER_TITLE},{HEADER_SUBTITLE},{INTRO_TITLE},{INTRO_BODY},{WARRANTY_TITLE},{WARRANTY_BODY},
-//     {PAYMENT_TITLE},{PAYMENT_BODY},{TRIP_FEE_RULE},{TAX_RATE},{TOTAL_LABEL}
-//   Runtime placeholders:
-//     {JobID},{Summary},{LineItemsTable},{Subtotal},{TripFee},{Tax},{Total}
+// - No email is sent from this worker
 //
 // NEW: Base44 sync (Option 2)
 // - After writing estimate_json + status='complete', calls Base44 function endpoint to create/update Base44 Estimate entity.
-// - Endpoint: BASE44_SYNC_URL (example: https://binsr-pro-flow.base44.app/api/functions/syncEstimateFromSupabase)
+// - Endpoint: BASE44_SYNC_URL
 // - Security: header x-webhook-secret = ESTIMATE_SYNC_WEBHOOK_SECRET
 //
 // REQUIRED Vercel env vars:
 //   SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
 //   OPENAI_API_KEY
-//   SENDGRID_API_KEY
-//   EMAIL_FROM
 //
 // REQUIRED for Base44 sync:
 //   BASE44_SYNC_URL
 //   ESTIMATE_SYNC_WEBHOOK_SECRET
 //
 // OPTIONAL env vars:
-//   INCLUDE_INSPECTION        (default "false")  -> include inspection report PDF
-//   MAX_PDF_TEXT_CHARS        (default 35000)    -> limits PDF text fed to AI
+//   INCLUDE_INSPECTION        (default "false")
+//   MAX_PDF_TEXT_CHARS        (default 35000)
 //   STALE_MINUTES             (default 20)
 //   OPENAI_TIMEOUT_MS         (default 120000)
 //   TAX_RATE_DEFAULT          (default 0.112)
 //   TEMPLATE_KEY_DEFAULT      (default "BINSR_PROS_REPAIR_ESTIMATE_V1")
 //
 // Dependencies:
-//   npm i pdf-parse openai @supabase/supabase-js @sendgrid/mail
+//   npm i pdf-parse openai @supabase/supabase-js
 
 export const config = { runtime: "nodejs" };
 
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import pdf from "pdf-parse";
-import sgMail from "@sendgrid/mail";
 
-const INTERNAL_COPY_EMAIL = "BINSR@dignhomes.com";
 const FETCH_TIMEOUT_MS = 30000;
 
 const INCLUDE_INSPECTION =
@@ -60,16 +52,19 @@ const TEMPLATE_KEY_DEFAULT = String(
   process.env.TEMPLATE_KEY_DEFAULT || "BINSR_PROS_REPAIR_ESTIMATE_V1"
 );
 
-// Base44 sync
 const BASE44_SYNC_URL = String(process.env.BASE44_SYNC_URL || "");
-const ESTIMATE_SYNC_WEBHOOK_SECRET = String(process.env.ESTIMATE_SYNC_WEBHOOK_SECRET || "");
+const ESTIMATE_SYNC_WEBHOOK_SECRET = String(
+  process.env.ESTIMATE_SYNC_WEBHOOK_SECRET || ""
+);
 
 function nowIso() {
   return new Date().toISOString();
 }
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
 async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -79,10 +74,12 @@ async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
     clearTimeout(t);
   }
 }
+
 function clamp(text, maxChars) {
   if (!text) return "";
   return text.length <= maxChars ? text : text.slice(0, maxChars) + "\n\n[TRUNCATED]";
 }
+
 async function pdfTextFromUrl(url) {
   const r = await fetchWithTimeout(url);
   if (!r.ok) throw new Error(`Failed to fetch PDF (${r.status}) from ${url}`);
@@ -90,6 +87,7 @@ async function pdfTextFromUrl(url) {
   const parsed = await pdf(buf);
   return parsed?.text || "";
 }
+
 async function withTimeout(promise, ms, label = "operation") {
   let t;
   const timeout = new Promise((_, reject) => {
@@ -101,22 +99,11 @@ async function withTimeout(promise, ms, label = "operation") {
     clearTimeout(t);
   }
 }
+
 function round2(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-function money(n) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return "";
-  return x.toLocaleString(undefined, { style: "currency", currency: "USD" });
-}
+
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
@@ -125,57 +112,6 @@ function normalize(s) {
     .trim();
 }
 
-function buildLineItemsTableHtml(items) {
-  const rows = (items || [])
-    .slice(0, 80)
-    .map((li) => {
-      return `
-        <tr>
-          <td style="padding:8px;border-bottom:1px solid #eee;">
-            <strong>${escapeHtml(li?.name || li?.code || "")}</strong>
-            ${
-              li?.description
-                ? `<div style="color:#555;font-size:12px;margin-top:2px;">${escapeHtml(
-                    li.description
-                  )}</div>`
-                : ""
-            }
-          </td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(
-            String(li?.qty ?? "")
-          )}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(
-            money(li?.unit_price)
-          )}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;">${escapeHtml(
-            money(li?.total)
-          )}</td>
-        </tr>
-      `;
-    })
-    .join("");
-
-  return `
-    <table style="width:100%;border-collapse:collapse;">
-      <thead>
-        <tr>
-          <th style="text-align:left;padding:8px;border-bottom:2px solid #ddd;">Item</th>
-          <th style="text-align:right;padding:8px;border-bottom:2px solid #ddd;">Qty</th>
-          <th style="text-align:right;padding:8px;border-bottom:2px solid #ddd;">Unit</th>
-          <th style="text-align:right;padding:8px;border-bottom:2px solid #ddd;">Total</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${
-          rows ||
-          `<tr><td colspan="4" style="padding:8px;color:#555;">No line items returned.</td></tr>`
-        }
-      </tbody>
-    </table>
-  `;
-}
-
-// Turn template_blocks rows into a placeholder map for a template_key
 function blocksToMap(templateBlocks, templateKey) {
   const m = new Map();
 
@@ -200,33 +136,6 @@ function blocksToMap(templateBlocks, templateKey) {
   return m;
 }
 
-// Replace {BLOCK_KEY} placeholders with values from blockMap, then fill runtime placeholders.
-function applyPlaceholders(templateHtml, ctx, blockMap) {
-  let html = String(templateHtml ?? "");
-
-  // 1) Fill block placeholders like {HEADER_TITLE}
-  if (blockMap && blockMap.size) {
-    for (const [k, v] of blockMap.entries()) {
-      html = html.replaceAll(`{${k}}`, String(v ?? ""));
-    }
-  }
-
-  // 2) Fill runtime placeholders
-  const pairs = [
-    ["{JobID}", ctx.jobId ?? ""],
-    ["{Summary}", ctx.summary ?? ""],
-    ["{LineItemsTable}", ctx.lineItemsTable ?? ""],
-    ["{Subtotal}", money(ctx.subtotal)],
-    ["{TripFee}", money(ctx.tripFee)],
-    ["{Tax}", money(ctx.tax)],
-    ["{Total}", money(ctx.total)],
-  ];
-
-  for (const [k, v] of pairs) html = html.replaceAll(k, String(v ?? ""));
-  return html;
-}
-
-// Status variants (case/spacing issues)
 const QUEUED_VARIANTS = ["queued", "Queued", "QUEUED", "estimating", "Estimating", "ESTIMATING"];
 const PROCESSING_VARIANTS = ["processing", "Processing", "PROCESSING"];
 const AI_STARTED_VARIANTS = ["ai_started", "AI_STARTED", "Ai_Started", "ai-started", "AI-STARTED"];
@@ -235,7 +144,6 @@ async function claimJob(supabase) {
   const cols =
     "id,email,first_name,last_name,phone,notes,binsr_url,inspection_url,close_of_escrow_date,property_address,city,zip,base44_job_id,base44_estimate_id,status,started_at,ai_started_at,created_at";
 
-  // queued first
   const { data: queued, error: qErr } = await supabase
     .from("estimate_jobs")
     .select(cols)
@@ -246,7 +154,6 @@ async function claimJob(supabase) {
   if (qErr) throw new Error(`DB pick queued failed: ${qErr.message}`);
   if (queued?.length) return queued[0];
 
-  // reclaim stale processing / ai_started
   const staleCutoff = new Date(Date.now() - STALE_MINUTES * 60 * 1000).toISOString();
   const { data: stale, error: sErr } = await supabase
     .from("estimate_jobs")
@@ -272,7 +179,7 @@ async function loadActiveConfig(supabase) {
 
   if (cfgErr || !cfg) throw new Error("No active config_versions row found.");
 
-  const [pbRes, aliasRes, tripRes, rulesRes, tmplRes, tmplBlocksRes] = await Promise.all([
+  const [pbRes, aliasRes, tripRes, rulesRes, tmplBlocksRes] = await Promise.all([
     supabase.from("pricebook_items").select("code,name,unit,unit_price,min_qty,notes").eq("active", true),
     supabase.from("aliases").select("alias,code").eq("active", true),
     supabase.from("trip_fees").select("label,base_fee,per_mile,after_hours_fee").eq("active", true),
@@ -281,7 +188,6 @@ async function loadActiveConfig(supabase) {
       .select("rule_key,rule_text,priority")
       .eq("active", true)
       .order("priority", { ascending: true }),
-    supabase.from("templates").select("template_key,subject,body_html").eq("active", true),
     supabase
       .from("template_blocks")
       .select("template_key,block_key,block_type,block_order,block_value,active")
@@ -292,20 +198,18 @@ async function loadActiveConfig(supabase) {
   if (aliasRes.error) throw new Error(`aliases load failed: ${aliasRes.error.message}`);
   if (tripRes.error) throw new Error(`trip_fees load failed: ${tripRes.error.message}`);
   if (rulesRes.error) throw new Error(`estimate_rules load failed: ${rulesRes.error.message}`);
-  if (tmplRes.error) throw new Error(`templates load failed: ${tmplRes.error.message}`);
   if (tmplBlocksRes.error) throw new Error(`template_blocks load failed: ${tmplBlocksRes.error.message}`);
 
   const pricebook = pbRes.data || [];
   const aliases = aliasRes.data || [];
   const tripFees = tripRes.data || [];
   const rules = rulesRes.data || [];
-  const templates = tmplRes.data || [];
   const templateBlocks = tmplBlocksRes.data || [];
 
   const pricebookMap = new Map(pricebook.map((p) => [p.code, p]));
   const aliasMap = new Map(aliases.map((a) => [String(a.alias || "").toLowerCase(), a.code]));
 
-  return { cfg, pricebook, pricebookMap, aliasMap, tripFees, rules, templates, templateBlocks };
+  return { cfg, pricebook, pricebookMap, aliasMap, tripFees, rules, templateBlocks };
 }
 
 function getTaxRateFromTemplateBlocks(blockMap) {
@@ -386,7 +290,6 @@ function bestAliasMatch(rawText, aliasMap) {
 }
 
 async function syncBase44Estimate(jobId, debug) {
-  // Do not hard-fail the job if sync is not configured
   if (!BASE44_SYNC_URL) {
     debug.base44_sync = { attempted: false, reason: "BASE44_SYNC_URL not set" };
     return;
@@ -455,10 +358,8 @@ export default async function handler(req, res) {
     const supabaseUrl = process.env.SUPABASE_URL;
     const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const openaiKey = process.env.OPENAI_API_KEY;
-    const sendgridKey = process.env.SENDGRID_API_KEY;
-    const emailFrom = process.env.EMAIL_FROM;
 
-    if (!supabaseUrl || !supabaseKey || !openaiKey || !sendgridKey || !emailFrom) {
+    if (!supabaseUrl || !supabaseKey || !openaiKey) {
       return res.status(500).json({ ok: false, error: "Missing env vars", debug });
     }
 
@@ -491,7 +392,6 @@ export default async function handler(req, res) {
 
     console.log("PROCESS_JOB_START", job.id);
 
-    // PDFs to use
     debug.steps.push("fetch_parse_pdfs");
     const sources = [];
     if (job.binsr_url) sources.push({ label: "BINSR", url: job.binsr_url });
@@ -508,7 +408,6 @@ export default async function handler(req, res) {
     }
     combined = clamp(combined, MAX_PDF_TEXT_CHARS);
 
-    // Mark AI started
     debug.steps.push("mark_ai_started");
     await supabase
       .from("estimate_jobs")
@@ -517,7 +416,6 @@ export default async function handler(req, res) {
 
     const openai = new OpenAI({ apiKey: openaiKey });
 
-    // Stage A: extract items (NO pricing)
     debug.steps.push("ai_stage_a_extract");
     const stageASchema = {
       type: "object",
@@ -562,7 +460,6 @@ export default async function handler(req, res) {
     const extracted = JSON.parse(stageAText);
     const extractedItems = Array.isArray(extracted?.items) ? extracted.items : [];
 
-    // Build shortlist of codes from aliases (keeps Stage B fast)
     debug.steps.push("build_shortlist");
     const candidates = new Set();
     for (const it of extractedItems) {
@@ -572,7 +469,6 @@ export default async function handler(req, res) {
     const shortlist = config.pricebook.filter((p) => candidates.has(p.code)).slice(0, 600);
     const pbForModel = shortlist.length ? shortlist : config.pricebook.slice(0, 600);
 
-    // Stage B: map items to codes (NO pricing, NO tax)
     debug.steps.push("ai_stage_b_map");
     const rulesText = (config.rules || [])
       .map((r) => `- (${r.rule_key}) ${r.rule_text}`)
@@ -636,15 +532,13 @@ export default async function handler(req, res) {
     if (!stageBText) throw new Error("Stage B missing output_text");
     const mapped = JSON.parse(stageBText);
 
-    // Enforce pricing from pricebook
     debug.steps.push("validate_and_price");
     const { corrected, errors, unmapped } = validateAndPrice(mapped, config.pricebookMap);
 
-    // Apply trip fee (requires TRIP_FEE exists in pricebook)
     debug.steps.push("apply_trip_fee");
     let tripFeeAmount = 0;
     if (config.tripFees?.length) {
-      const tf = config.tripFees[0]; // simplest: first active row
+      const tf = config.tripFees[0];
       const pbTrip = config.pricebookMap.get("TRIP_FEE");
       if (pbTrip) {
         tripFeeAmount = round2(Number(tf.base_fee || 0));
@@ -662,18 +556,12 @@ export default async function handler(req, res) {
       }
     }
 
-    // Select template + blocks
-    debug.steps.push("select_template");
+    debug.steps.push("load_tax_blocks");
     const templateKey = TEMPLATE_KEY_DEFAULT;
-    const tmpl = (config.templates || []).find((t) => t.template_key === templateKey);
-    if (!tmpl?.body_html)
-      throw new Error(`Missing templates.body_html for template_key=${templateKey}`);
-
     const blockMap = blocksToMap(config.templateBlocks, templateKey);
     debug.template_key = templateKey;
     debug.template_blocks_count = blockMap.size;
 
-    // Compute tax + total from TAX_RATE block (fallback env)
     debug.steps.push("compute_tax_total");
     const taxRate = getTaxRateFromTemplateBlocks(blockMap);
     const tax = round2(corrected.subtotal * taxRate);
@@ -685,7 +573,6 @@ export default async function handler(req, res) {
     corrected.trip_fee = tripFeeAmount;
     corrected.estimate_id = job.id;
 
-    // Save + complete
     debug.steps.push("save_estimate_complete");
     await supabase
       .from("estimate_jobs")
@@ -698,63 +585,32 @@ export default async function handler(req, res) {
         validation_errors: errors.length ? errors.join("\n") : null,
         unmapped_items: unmapped?.length ? unmapped : null,
         error: null,
+        email_error: null,
       })
       .eq("id", job.id);
 
     console.log("AI_DONE", job.id);
 
-    // NEW: Sync Base44 Estimate entity (do not fail job if sync fails)
     debug.steps.push("sync_base44_estimate");
     await syncBase44Estimate(job.id, debug);
 
-    // Render HTML from template + placeholders
-    debug.steps.push("render_template");
-    const ctx = {
+    return res.status(200).json({
+      ok: true,
       jobId: job.id,
-      summary: corrected.summary || "",
-      lineItemsTable: buildLineItemsTableHtml(corrected.line_items || []),
-      subtotal: corrected.subtotal ?? 0,
-      tripFee: corrected.trip_fee ?? 0,
-      tax: corrected.tax ?? 0,
-      total: corrected.total ?? 0,
-    };
-
-    const subject = String(tmpl.subject || `BINSR Pros Estimate - Job ${job.id}`).trim();
-    const html = applyPlaceholders(tmpl.body_html, ctx, blockMap);
-
-    // Email (customer + internal copy)
-    debug.steps.push("send_email");
-    sgMail.setApiKey(sendgridKey);
-
-    const toList = [job.email, INTERNAL_COPY_EMAIL].filter(Boolean);
-
-    try {
-      await sgMail.send({ to: toList, from: emailFrom, subject, html });
-
-      debug.steps.push("mark_email_sent");
-      await supabase
-        .from("estimate_jobs")
-        .update({ email_sent_at: nowIso(), email_error: null })
-        .eq("id", job.id);
-
-      console.log("EMAIL_SENT", job.id, toList);
-    } catch (mailErr) {
-      const msg = String(mailErr?.message || mailErr);
-      await supabase.from("estimate_jobs").update({ email_error: msg }).eq("id", job.id);
-      console.error("EMAIL_FAILED", job.id, msg);
-      return res.status(200).json({ ok: true, jobId: job.id, emailed: false, email_error: msg, debug });
-    }
-
-    return res.status(200).json({ ok: true, jobId: job.id, emailed: toList, debug });
+      emailed: false,
+      email_disabled: true,
+      debug,
+    });
   } catch (e) {
     console.error("process-job error:", e);
 
-    // Mark failed
     try {
       if (currentJobId) {
-        const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
-          auth: { persistSession: false },
-        });
+        const supabase = createClient(
+          process.env.SUPABASE_URL,
+          process.env.SUPABASE_SERVICE_ROLE_KEY,
+          { auth: { persistSession: false } }
+        );
         await supabase
           .from("estimate_jobs")
           .update({ status: "failed", error: String(e?.message || e) })
